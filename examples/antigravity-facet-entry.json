@@ -1,0 +1,10 @@
+{
+  "facet-local": {
+    "command": "/Users/tai_hungg/.nvm/versions/node/v24.12.0/bin/node",
+    "args": [
+      "/Users/tai_hungg/coding/facet/mcp-server/scripts/launch-local.mjs"
+    ],
+    "cwd": "/Users/tai_hungg/coding/facet/mcp-server",
+    "timeoutSeconds": 120
+  }
+}

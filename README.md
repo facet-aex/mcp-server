@@ -1,8 +1,13 @@
 # mcp-server
 
-Reserved Phase 4 MCP adapter exposing stable FACET discovery/execution meta-tools.
+Local Demo Track MCP adapter exposing stable FACET discovery/execution meta-tools.
 
-**Status:** repository initialized; implementation is blocked by earlier phase gates.
-It will delegate to Control/Gateway APIs and must not duplicate marketplace or execution logic.
+The server now describes a search → inspect schema → invoke workflow to the agent and accepts a normal task such as “Use FACET to analyze Bitcoin price history over the past month.” `invoke_facet` can generate an idempotency key for a new call if the agent omits it. A caller should supply the same key explicitly when retrying a pending settlement. MCP clients may ignore server instructions; a one-time workspace instruction to use FACET for live external data may still be useful. Search is bounded lexical ranking over published names, descriptions, categories and tags, not semantic retrieval.
 
-This repository is standalone and will consume only published FACET APIs/contracts when Phase 4 begins.
+**Status:** `search_facets`, `get_facet` and `invoke_facet` passed a real local MCP stdio test against the provider-published GitHub Facet, Gateway and GitHub API. The x402 signing/retry path settled a real 0.001 fUSD payment on Fuji; the same-key replay returned the recorded result. See the root `docs/implementation/demo-runbook.md` for transaction evidence.
+
+Install with `npm ci`, then `npm run build`. Configure an MCP client with `command: "node"`, `args: ["/absolute/path/to/mcp-server/dist/server.js"]` and `FACET_CONTROL_API_URL=http://127.0.0.1:4000`, `FACET_GATEWAY_URL=http://127.0.0.1:4020`. For paid calls, add the dedicated low-balance payer key, fixed recipient and atomic cap from `.env.example` in the client's private environment. This is a local stdio server; do not expose it publicly. `npm run smoke:live` requires `FACET_DEMO_FACET_ID` and `FACET_DEMO_VERSION_ID` from `control-api npm run demo:publish`.
+
+For Antigravity on this machine, use [the `facet-local` MCP entry](examples/antigravity-facet-entry.json) inside the existing `mcpServers` object in `~/.gemini/config/mcp_config.json`. It launches `scripts/launch-local.mjs`, which reads this repository's ignored `.env` before starting the built server. This keeps the payer key out of Antigravity's global config. Run `npm run smoke:launcher` before adding the entry. Do not replace other MCP entries in the user's global config.
+
+Dependencies: `@modelcontextprotocol/sdk` 1.32.2 (MIT, official maintained SDK) provides MCP tool and stdio support; `zod` 4.6.7 (MIT) validates tool arguments; official `@x402/core`/`@x402/evm` 2.30.0 (Apache-2.0) sign the payment response; viem 2.57.17 (MIT) loads the local testnet payer. TypeScript/tsx are development-only. SDK usage was checked against its versioned server documentation on 2026-11-11.
