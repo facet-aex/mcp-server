@@ -1,8 +1,18 @@
-# mcp-server instructions
+# `mcp-server` instructions
 
-- This is a standalone repository; it must never depend on parent/sibling source or configuration.
-- Use npm only and commit this repository's own `package-lock.json` when application code begins.
-- ADR-0011 permits local stdio MCP meta-tools for the supervised Demo Track before formal Phase 4. Hosted MCP/OAuth remains deferred.
-- Use stable meta-tools rather than one MCP tool per Facet.
-- Pin and re-verify the official MCP SDK/protocol version before implementation.
-- Never implement a second execution or payment state machine here.
+**Owner in Wave 1:** Antigravity  
+**Active architectural authority:** `../docs/architecture/decisions/ADR-0015-actorbazaar-docker-and-a2a-mvp.md`
+
+## Role
+
+MCP server (`@facet/mcp-server`) allowing existing autonomous AI agents (Claude, Cursor, Antigravity, OpenClaw) to discover, inspect, pay for (`x402` on Avalanche Fuji), and invoke all three Facet types (`HOSTED_ACTOR`, `AUTONOMOUS_AGENT`, `EXTERNAL_HTTP_API`).
+
+## Exposed Meta-Tools
+
+1. **`search_facets`:**
+   - Queries `GET /v1/catalog/facets` with optional `query`, `type` (`HOSTED_ACTOR` | `AUTONOMOUS_AGENT` | `EXTERNAL_HTTP_API`), `category`, and `limit`.
+   - Returns each Facet's `id`, `versionId`, `name`, `facetType`, `pricing`, `actorMeta` (`imageDigest`), and `agentMeta` (`erc8004TokenId`, `erc8004Registry`).
+2. **`get_facet`:**
+   - Retrieves full `PublicFacet` details including `inputSchema`, `outputSchema`, `pricing`, `actorMeta`, and `agentMeta`.
+3. **`invoke_facet`:**
+   - Invokes `POST /v1/facet-versions/:versionId/invoke` on `gateway`, automatically handling the HTTP `402 Payment Required` EIP-3009 `fUSD` signature handshake, and returns `{ runId, facetVersionId, facetType, result, dataset, usage, payment, receipt, replayed }`.

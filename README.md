@@ -1,6 +1,6 @@
 # mcp-server
 
-Local Demo Track MCP adapter exposing stable FACET discovery/execution meta-tools.
+Local MVP MCP adapter exposing stable FACET discovery/execution meta-tools. The next slice passes scoped Agent credentials from an operator-created CLI wallet/grant; no signing key enters MCP.
 
 The server now describes a search → inspect schema → invoke workflow to the agent and accepts a normal task such as “Use FACET to analyze Bitcoin price history over the past month.” `invoke_facet` can generate an idempotency key for a new call if the agent omits it. A caller should supply the same key explicitly when retrying a pending settlement. MCP clients may ignore server instructions; a one-time workspace instruction to use FACET for live external data may still be useful. Search is bounded lexical ranking over published names, descriptions, categories and tags, not semantic retrieval.
 

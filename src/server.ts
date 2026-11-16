@@ -31,39 +31,52 @@ function result(value: unknown) {
 }
 
 const server = new McpServer(
-  { name: "facet", version: "0.1.0" },
+  { name: "facet", version: "0.2.0" },
   {
     instructions:
-      "FACET is a marketplace of live API capabilities. When a user asks for current external data or an analysis requiring external data, search_facets using a short capability phrase (for example, 'bitcoin price history'), then get_facet for the best match to read its input schema. Infer input from the user's request, invoke_facet, and analyze the returned data. If search has no results, try a shorter English synonym. Never invent a Facet or an API result. Invocations may spend capped Fuji testnet fUSD.",
+      "FACET is a multi-modal capability marketplace on Avalanche unifying HOSTED_ACTOR (Docker Actors returning structured Datasets), AUTONOMOUS_AGENT (ERC-8004 bound A2A Agents), and EXTERNAL_HTTP_API services. First call search_facets with a short intent phrase (optionally filtering by type or category), then call get_facet to inspect its inputSchema, pricing, actorMeta.imageDigest or agentMeta.erc8004TokenId. Construct input matching inputSchema and call invoke_facet, which handles capped Fuji testnet fUSD x402 payment and returns result, dataset, usage, payment, and on-chain receipt.",
   },
 );
+
 server.registerTool(
   "search_facets",
   {
     description:
-      "Search the FACET marketplace for live API capabilities by natural language intent. Use this first when a task needs external data; try short phrases such as 'Bitcoin historical price chart'.",
-    inputSchema: { query: z.string().max(120).default("") },
+      "Search the FACET marketplace for Hosted Actors, ERC-8004 A2A Agents, or External APIs by intent, optional facetType, and optional category.",
+    inputSchema: {
+      query: z.string().max(120).default(""),
+      type: z
+        .enum(["EXTERNAL_HTTP_API", "HOSTED_ACTOR", "AUTONOMOUS_AGENT"])
+        .optional(),
+      category: z.string().max(80).optional(),
+    },
   },
-  async ({ query }) => {
-    const path = `/v1/catalog/facets?q=${encodeURIComponent(query)}`;
+  async ({ query, type, category }) => {
+    const params = new URLSearchParams();
+    params.set("q", query);
+    if (type) params.set("type", type);
+    if (category) params.set("category", category);
+    const path = `/v1/catalog/facets?${params.toString()}`;
     return result(await request(controlUrl, path));
   },
 );
+
 server.registerTool(
   "get_facet",
   {
     description:
-      "Read a published Facet's input and output schema before invoking it. Use the returned versionId and construct input from the user's intent.",
+      "Read a published Facet's inputSchema, outputSchema, pricing, actorMeta (imageDigest), and agentMeta (ERC-8004 Token ID) before invoking it.",
     inputSchema: { facetId: z.string().uuid() },
   },
   async ({ facetId }) =>
     result(await request(controlUrl, `/v1/catalog/facets/${facetId}`)),
 );
+
 server.registerTool(
   "invoke_facet",
   {
     description:
-      "Call the selected FACET API capability with input matching get_facet's schema. The local payer handles a capped Fuji testnet x402 payment automatically when configured.",
+      "Execute a Hosted Actor, ERC-8004 A2A Agent, or External API with input matching get_facet's schema. Automatically handles capped Fuji testnet fUSD x402 payment and returns result, dataset, usage, payment, and on-chain receipt.",
     inputSchema: {
       facetVersionId: z.string().uuid(),
       input: z.record(z.string(), z.unknown()),

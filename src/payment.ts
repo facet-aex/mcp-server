@@ -7,6 +7,17 @@ import { ExactEvmScheme } from "@x402/evm/exact/client";
 import { privateKeyToAccount } from "viem/accounts";
 
 const fujiAsset = "0xe7082a54a456dc4dfe0ceadcd0d0dce7d8ba176f";
+const addressPattern = /^0x[a-f0-9]{40}$/iu;
+
+function isRecipientAllowed(payTo: string, allowedSpec: string): boolean {
+  if (!addressPattern.test(payTo)) return false;
+  if (allowedSpec.trim() === "*") return true;
+  const allowlist = allowedSpec
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  return allowlist.includes(payTo.toLowerCase());
+}
 
 export function checkChallenge(
   header: string,
@@ -23,7 +34,7 @@ export function checkChallenge(
     option.scheme !== "exact" ||
     option.network !== "eip155:43113" ||
     option.asset.toLowerCase() !== fujiAsset.toLowerCase() ||
-    option.payTo.toLowerCase() !== recipient.toLowerCase() ||
+    !isRecipientAllowed(option.payTo, recipient) ||
     !/^[1-9][0-9]*$/u.test(option.amount) ||
     BigInt(option.amount) > maxAtomic ||
     option.extra?.name !== "FACET USD" ||
@@ -72,11 +83,16 @@ export async function invokeWithPayment(
     !key ||
     !/^0x[a-f0-9]{64}$/iu.test(key) ||
     !recipient ||
-    !/^0x[a-f0-9]{40}$/iu.test(recipient) ||
     !max ||
     !/^[1-9][0-9]*$/u.test(max)
   )
     throw new Error("LOCAL_TESTNET_PAYER_NOT_CONFIGURED");
+  if (
+    recipient.trim() !== "*" &&
+    !recipient.split(",").every((entry) => addressPattern.test(entry.trim()))
+  ) {
+    throw new Error("LOCAL_TESTNET_PAYER_NOT_CONFIGURED");
+  }
   const challenge = first.headers.get("PAYMENT-REQUIRED");
   if (!challenge) throw new Error("PAYMENT_CHALLENGE_MISSING");
   const required = checkChallenge(

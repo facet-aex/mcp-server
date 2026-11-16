@@ -32,6 +32,14 @@ describe("MCP payer guard", () => {
         gateway,
       ).accepts[0]?.amount,
     ).toBe("1000");
+    expect(
+      checkChallenge(
+        encodePaymentRequiredHeader(required),
+        `0x0000000000000000000000000000000000000002,${recipient}`,
+        1000n,
+        gateway,
+      ).accepts[0]?.payTo,
+    ).toBe(recipient);
     expect(() =>
       checkChallenge(
         encodePaymentRequiredHeader(required),
