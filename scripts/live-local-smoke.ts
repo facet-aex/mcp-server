@@ -1,3 +1,4 @@
+import { DEFAULT_FACET_ORIGIN } from "@facet-aex/cli";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { loadEnvFile } from "node:process";
@@ -12,14 +13,14 @@ const facetId = process.env.FACET_DEMO_FACET_ID;
 const versionId = process.env.FACET_DEMO_VERSION_ID;
 if (!facetId || !versionId)
   throw new Error("FACET_DEMO_FACET_ID and FACET_DEMO_VERSION_ID are required");
+const origin = process.env.FACET_ORIGIN ?? DEFAULT_FACET_ORIGIN;
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [new URL("../dist/server.js", import.meta.url).pathname],
   env: {
     ...process.env,
-    FACET_CONTROL_API_URL:
-      process.env.FACET_CONTROL_API_URL ?? "http://127.0.0.1:4000",
-    FACET_GATEWAY_URL: process.env.FACET_GATEWAY_URL ?? "http://127.0.0.1:4020",
+    FACET_CONTROL_API_URL: process.env.FACET_CONTROL_API_URL ?? origin,
+    FACET_GATEWAY_URL: process.env.FACET_GATEWAY_URL ?? origin,
   },
   stderr: "pipe",
 });

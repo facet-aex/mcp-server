@@ -1,10 +1,24 @@
 {
-  "name": "@facet/mcp-server",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@facet-aex/mcp-server",
+  "version": "0.2.0",
+  "description": "Local stdio MCP server for FACET capability discovery and policy-bounded Avalanche Fuji x402 invocation.",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "bin": {
+    "facet-mcp": "./dist/server.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "node --eval \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prebuild": "npm run clean",
+    "postbuild": "node --eval \"require('node:fs').chmodSync('dist/server.js', 0o755)\"",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
@@ -17,10 +31,11 @@
     "smoke:launcher": "npm run build && tsx scripts/launcher-smoke.ts"
   },
   "engines": {
-    "node": ">=24.12.0 <25"
+    "node": ">=22.0.0"
   },
   "packageManager": "npm@11.6.2",
   "dependencies": {
+    "@facet-aex/cli": "file:../agent-sdk",
     "@modelcontextprotocol/sdk": "1.32.2",
     "@x402/core": "2.30.0",
     "@x402/evm": "2.30.0",
