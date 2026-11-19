@@ -1,0 +1,37 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run npm publish --dry-run instead of publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Ensure npm >= 11.5.1 for Trusted Publishing (OIDC)
+        run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm run verify
+      - name: Publish @facet-aex/mcp-server via Trusted Publishing (OIDC)
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            npm publish --dry-run --access public
+          else
+            npm publish --provenance --access public
+          fi

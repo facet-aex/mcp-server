@@ -2,6 +2,10 @@
   "name": "@facet-aex/mcp-server",
   "version": "0.2.0",
   "description": "Local stdio MCP server for FACET capability discovery and policy-bounded Avalanche Fuji x402 invocation.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/facet-aex/mcp-server.git"
+  },
   "private": false,
   "publishConfig": {
     "access": "public"
@@ -12,13 +16,14 @@
     "README.md"
   ],
   "bin": {
-    "facet-mcp": "./dist/server.js"
+    "facet-mcp": "dist/server.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "node --eval \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "prebuild": "npm run clean",
     "postbuild": "node --eval \"require('node:fs').chmodSync('dist/server.js', 0o755)\"",
+    "prepack": "npm run build",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
