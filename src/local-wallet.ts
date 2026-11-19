@@ -7,10 +7,17 @@ import {
   defaultSpendLedgerPath,
   formatFusdAtomic,
   resolveProfileName,
+  type FacetType,
   type FujiRpcClient,
 } from "@facet-aex/cli";
 
 export const SNOWTRACE_TX_BASE = "https://testnet.snowtrace.io/tx/" as const;
+
+export interface RetainedPaymentSignature {
+  inputFingerprint: string;
+  paymentHeader: string;
+  amountAtomic: string;
+}
 
 export interface LocalBuyerRuntime {
   profile: string;
@@ -18,6 +25,7 @@ export interface LocalBuyerRuntime {
   policyStore: PolicyStore;
   spendLedger: SpendLedger;
   fujiClient: FujiRpcClient;
+  retainedPaymentSignatures: Map<string, RetainedPaymentSignature>;
 }
 
 export function createLocalBuyerRuntime(
@@ -27,6 +35,7 @@ export function createLocalBuyerRuntime(
     policyStore?: PolicyStore;
     spendLedger?: SpendLedger;
     fujiClient?: FujiRpcClient;
+    retainedPaymentSignatures?: Map<string, RetainedPaymentSignature>;
     env?: NodeJS.ProcessEnv;
   } = {},
 ): LocalBuyerRuntime {
@@ -49,6 +58,7 @@ export function createLocalBuyerRuntime(
       }),
     fujiClient:
       options.fujiClient ?? createViemFujiClient(env.FACET_FUJI_RPC_URL),
+    retainedPaymentSignatures: options.retainedPaymentSignatures ?? new Map(),
   };
 }
 
@@ -58,10 +68,11 @@ export function snowtraceTxUrl(txHash: string): string {
 
 export interface GatewayPaidResponse {
   runId: string;
-  facetVersionId: string;
-  facetFullName?: string;
-  displayVersion?: string;
-  facetType?: string;
+  provider?: string;
+  facetName?: string;
+  facetDisplayName?: string;
+  version?: string;
+  facetType?: FacetType;
   result: unknown;
   dataset?: Record<string, unknown>[];
   usage?: {
@@ -76,7 +87,7 @@ export interface GatewayPaidResponse {
     network: string;
     amountAtomic?: string;
     payer?: string;
-    creatorPayTo?: string;
+    providerPayTo?: string;
     payTo?: string;
   };
   receipt?: {
@@ -92,24 +103,30 @@ export interface GatewayPaidResponse {
 export function formatSettledInvokeResult(
   body: GatewayPaidResponse,
   fallback: {
+    provider: string;
+    facetName: string;
+    facetDisplayName: string;
+    version: string;
+    facetType: FacetType;
     amountAtomic: string;
     payer: string;
-    creatorPayTo: string;
+    providerPayTo: string;
   },
 ): Record<string, unknown> {
   const paymentTx = body.payment?.transaction;
   const receiptTx = body.receipt?.receiptTxHash;
   const amountAtomic = body.payment?.amountAtomic ?? fallback.amountAtomic;
   const payer = body.payment?.payer ?? fallback.payer;
-  const creatorPayTo = body.payment?.creatorPayTo ?? fallback.creatorPayTo;
+  const providerPayTo = body.payment?.providerPayTo ?? fallback.providerPayTo;
 
   return {
     status: "SETTLED",
     runId: body.runId,
-    facetVersionId: body.facetVersionId,
-    ...(body.facetFullName ? { facetFullName: body.facetFullName } : {}),
-    ...(body.displayVersion ? { displayVersion: body.displayVersion } : {}),
-    ...(body.facetType ? { facetType: body.facetType } : {}),
+    provider: body.provider ?? fallback.provider,
+    facetName: body.facetName ?? fallback.facetName,
+    facetDisplayName: body.facetDisplayName ?? fallback.facetDisplayName,
+    version: body.version ?? fallback.version,
+    facetType: body.facetType ?? fallback.facetType,
     result: body.result,
     ...(body.dataset ? { dataset: body.dataset } : {}),
     ...(body.usage ? { usage: body.usage } : {}),
@@ -120,7 +137,7 @@ export function formatSettledInvokeResult(
       amountAtomic,
       amountFormatted: formatFusdAtomic(BigInt(amountAtomic)),
       payer,
-      creatorPayTo,
+      providerPayTo,
       ...(paymentTx ? { snowtraceUrl: snowtraceTxUrl(paymentTx) } : {}),
     },
     ...(body.receipt
@@ -136,7 +153,11 @@ export function formatSettledInvokeResult(
 
 export function formatPendingInvokeResult(options: {
   runId?: string;
-  facetVersionId: string;
+  provider: string;
+  facetName: string;
+  facetDisplayName: string;
+  version: string;
+  facetType: FacetType;
   idempotencyKey: string;
   amountAtomic: string;
   paymentStatus: string;
@@ -145,7 +166,11 @@ export function formatPendingInvokeResult(options: {
   return {
     status: "PENDING",
     ...(options.runId ? { runId: options.runId } : {}),
-    facetVersionId: options.facetVersionId,
+    provider: options.provider,
+    facetName: options.facetName,
+    facetDisplayName: options.facetDisplayName,
+    version: options.version,
+    facetType: options.facetType,
     idempotencyKey: options.idempotencyKey,
     amountAtomic: options.amountAtomic,
     amountFormatted: formatFusdAtomic(BigInt(options.amountAtomic)),
@@ -158,6 +183,6 @@ export function formatPendingInvokeResult(options: {
           }
         : {}),
     },
-    note: "Settlement or receipt confirmation is pending. Retry invoke_facet with the same idempotencyKey and input to reconcile without a second charge.",
+    note: "Settlement or receipt confirmation is pending. Retry invoke_facet with the same provider, facetName, version, idempotencyKey, and input to reconcile without a second charge.",
   };
 }

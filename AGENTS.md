@@ -1,18 +1,19 @@
 # `mcp-server` instructions
 
-**Owner in Wave 1:** Antigravity  
-**Active architectural authority:** `../docs/architecture/decisions/ADR-0015-actorbazaar-docker-and-a2a-mvp.md`
+**Active architectural authority:** `../docs/architecture/decisions/ADR-0018-canonical-identities-semver-and-clerk-webhooks.md`
 
 ## Role
 
-MCP server (`@facet/mcp-server`) allowing existing autonomous AI agents (Claude, Cursor, Antigravity, OpenClaw) to discover, inspect, pay for (`x402` on Avalanche Fuji), and invoke all three Facet types (`HOSTED_ACTOR`, `AUTONOMOUS_AGENT`, `EXTERNAL_HTTP_API`).
+MCP server (`@facet-aex/mcp-server`) allowing autonomous AI clients (Codex, Claude Code, Antigravity) to discover, inspect, pay for (`x402` EIP-3009 `fUSD` on Avalanche Fuji `43113`), and invoke all three canonical Facet types (`API`, `ACTOR`, `AGENT`) using policy-bounded local wallets from `@facet-aex/cli`.
 
-## Exposed Meta-Tools
+## Exposed Meta-Tools (Option B Natural Keys + SemVer)
 
 1. **`search_facets`:**
-   - Queries `GET /v1/catalog/facets` with optional `query`, `type` (`HOSTED_ACTOR` | `AUTONOMOUS_AGENT` | `EXTERNAL_HTTP_API`), `category`, and `limit`.
-   - Returns each Facet's `id`, `versionId`, `name`, `facetType`, `pricing`, `actorMeta` (`imageDigest`), and `agentMeta` (`erc8004TokenId`, `erc8004Registry`).
+   - Queries `GET /v1/catalog/facets` with optional `query`, `type` (`API` | `ACTOR` | `AGENT`), `category`, and `limit`.
+   - Returns each Facet's `provider` (`users.username`), `facetName`, `facetDisplayName`, SemVer `version`, `facetType`, `pricing`, `actorMeta` (`imageDigest`), and `agentMeta` (`erc8004TokenId`, `erc8004Registry`).
 2. **`get_facet`:**
+   - Accepts `{ provider, facetName, version? }` and calls `GET /v1/catalog/facets/:provider/:facetName` or `.../versions/:version`.
    - Retrieves full `PublicFacet` details including `inputSchema`, `outputSchema`, `pricing`, `actorMeta`, and `agentMeta`.
 3. **`invoke_facet`:**
-   - Invokes `POST /v1/facet-versions/:versionId/invoke` on `gateway`, automatically handling the HTTP `402 Payment Required` EIP-3009 `fUSD` signature handshake, and returns `{ runId, facetVersionId, facetType, result, dataset, usage, payment, receipt, replayed }`.
+   - Accepts `{ provider, facetName, version, input, idempotencyKey? }` and invokes `POST /v1/facets/:provider/:facetName/versions/:version/invoke` on `gateway`.
+   - Enforces default-deny `PolicyStore` grants, pins `providerPayTo` and `FacetFeeSplitAndEscrow`, locks UTC daily spend caps in `SpendLedger`, signs EIP-3009 `fUSD` without exposing private keys, retains `PAYMENT-SIGNATURE` across `202` pending/timeout retries, and returns settled/pending status with Snowtrace links (`provider`, `facetName`, `facetDisplayName`, `version`, `facetType`, `result`, `dataset`, `usage`, `payment`, `receipt`, `replayed`).

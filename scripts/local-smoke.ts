@@ -9,6 +9,7 @@ import {
   PolicyStore,
   SpendLedger,
   WalletStore,
+  snowtraceTxUrl,
   type CredentialBackend,
   type FujiRpcClient,
   type PublicFacetRecord,
@@ -23,28 +24,29 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { createLocalBuyerRuntime } from "../src/local-wallet.js";
 import { invokeWithPayment } from "../src/payment.js";
 
-const facetId = "00000000-0000-4000-8000-000000000001";
-const versionId = "00000000-0000-4000-8000-000000000002";
-const creatorPayTo = "0x0000000000000000000000000000000000000001";
+const provider = "octocat-dev";
+const facetName = "github-repository";
+const facetDisplayName = "GitHub repository";
+const version = "1.0.0";
+const providerPayTo = "0x0000000000000000000000000000000000000001";
+const runId = "00000000-0000-4000-8000-000000000001";
 const paymentTx = `0x${"1".repeat(64)}`;
 const receiptTx = `0x${"2".repeat(64)}`;
 const payerKey = generatePrivateKey();
 const payerAddress = privateKeyToAccount(payerKey).address;
 
 const facet: PublicFacetRecord = {
-  id: facetId,
-  versionId,
-  slug: "github-repository",
-  fullName: "octocat/github-repository",
-  name: "GitHub repository",
-  displayVersion: "v1",
-  facetType: "HOSTED_ACTOR",
+  provider,
+  facetName,
+  facetDisplayName,
+  version,
+  facetType: "ACTOR",
   pricing: {
     model: "PAY_PER_RUN",
     priceAtomic: "1000",
     assetAddress: FUSD_ASSET_ADDRESS,
     chainId: FUJI_CHAIN_ID,
-    payTo: creatorPayTo,
+    payTo: providerPayTo,
   },
   actorMeta: {
     runtime: "nodejs22-alpine-v1",
@@ -63,19 +65,23 @@ const httpServer = createServer(async (request, response) => {
     return;
   }
   if (
-    request.url === `/v1/catalog/facets/${facetId}` ||
-    request.url === "/v1/catalog/facets/octocat/github-repository"
+    request.url === `/v1/catalog/facets/${provider}/${facetName}` ||
+    request.url ===
+      `/v1/catalog/facets/${provider}/${facetName}/versions/${version}`
   ) {
     response.end(JSON.stringify({ facet }));
     return;
   }
-  if (request.url === `/v1/facet-versions/${versionId}/invoke`) {
+  if (
+    request.url ===
+    `/v1/facets/${provider}/${facetName}/versions/${version}/invoke`
+  ) {
     const signature = request.headers["payment-signature"];
     if (typeof signature !== "string") {
       const required = {
         x402Version: 2,
         resource: {
-          url: `${mockOrigin}/v1/facet-versions/${versionId}/invoke?fingerprint=smoke`,
+          url: `${mockOrigin}/v1/facets/${provider}/${facetName}/versions/${version}/invoke?fingerprint=smoke`,
         },
         accepts: [
           {
@@ -88,7 +94,6 @@ const httpServer = createServer(async (request, response) => {
             extra: {
               name: "FACET USD",
               version: "2",
-              creatorPayTo,
             },
           },
         ],
@@ -108,8 +113,12 @@ const httpServer = createServer(async (request, response) => {
     signedCalls++;
     response.end(
       JSON.stringify({
-        runId: facetId,
-        facetVersionId: versionId,
+        runId,
+        provider,
+        facetName,
+        facetDisplayName,
+        version,
+        facetType: "ACTOR",
         result: { full_name: "octocat/Hello-World" },
         replayed: false,
         payment: {
@@ -117,7 +126,7 @@ const httpServer = createServer(async (request, response) => {
           network: "eip155:43113",
           amountAtomic: "1000",
           payer: payerAddress,
-          creatorPayTo,
+          providerPayTo,
         },
         receipt: {
           inputHash: `sha256:${"c".repeat(64)}`,
@@ -140,14 +149,11 @@ const ledgerPath = join(tempDir, "spend-ledger.json");
 const policyStore = new PolicyStore({ filePath: policyPath });
 await policyStore.grant({
   facet,
-  facetId,
-  versionId,
   maxPerRunAtomic: "1000",
   dailyCapAtomic: "10000",
   expiresAt: "2030-01-01T00:00:00Z",
 });
 
-// Verify local wallet/policy/ledger bundle works over direct HTTP x402 call, plus stdio server protocol smoke.
 const memBackend: CredentialBackend = {
   async hasSecret() {
     return true;
@@ -208,24 +214,35 @@ try {
     throw new Error(`Unexpected MCP tools: ${names.join(",")}`);
   const searched = await client.callTool({
     name: "search_facets",
-    arguments: { query: "GitHub" },
+    arguments: { query: "GitHub", type: "ACTOR" },
   });
-  if (!JSON.stringify(searched).includes("GitHub repository"))
+  if (!JSON.stringify(searched).includes(facetDisplayName))
     throw new Error(
       `MCP search did not return the catalog item: ${JSON.stringify(searched)}`,
     );
   const detail = await client.callTool({
     name: "get_facet",
-    arguments: { facetId: "octocat/github-repository" },
+    arguments: { provider, facetName, version },
   });
-  if (!JSON.stringify(detail).includes(versionId))
+  const detailText =
+    (detail.content as Array<{ text?: string }>)[0]?.text ?? "";
+  const parsedDetail = JSON.parse(detailText) as {
+    facet?: { provider?: string; facetName?: string; version?: string };
+  };
+  if (
+    parsedDetail.facet?.provider !== provider ||
+    parsedDetail.facet?.facetName !== facetName ||
+    parsedDetail.facet?.version !== version
+  )
     throw new Error(
-      `MCP detail did not resolve username/facet-name: ${JSON.stringify(detail)}`,
+      `MCP detail did not resolve provider/facetName/version: ${JSON.stringify(detail)}`,
     );
   const denied = await client.callTool({
     name: "invoke_facet",
     arguments: {
-      facetVersionId: "00000000-0000-4000-8000-000000000099",
+      provider: "ungranted-dev",
+      facetName,
+      version,
       input: { owner: "octocat", repo: "Hello-World" },
     },
   });
@@ -237,28 +254,37 @@ try {
   const paid = (await invokeWithPayment({
     controlUrl: mockOrigin,
     gatewayUrl: mockOrigin,
-    facetVersionId: versionId,
+    provider,
+    facetName,
+    version,
     input: { owner: "octocat", repo: "Hello-World" },
     idempotencyKey: "smoke-idempotency-key",
     runtime,
   })) as {
     status?: string;
-    payment?: { snowtraceUrl?: string };
+    provider?: string;
+    facetName?: string;
+    facetDisplayName?: string;
+    version?: string;
+    payment?: { providerPayTo?: string; snowtraceUrl?: string };
     receipt?: { snowtraceUrl?: string };
   };
   if (
     signedCalls !== 1 ||
     paid.status !== "SETTLED" ||
-    paid.payment?.snowtraceUrl !==
-      `https://testnet.snowtrace.io/tx/${paymentTx}` ||
-    paid.receipt?.snowtraceUrl !==
-      `https://testnet.snowtrace.io/tx/${receiptTx}`
+    paid.provider !== provider ||
+    paid.facetName !== facetName ||
+    paid.facetDisplayName !== facetDisplayName ||
+    paid.version !== version ||
+    paid.payment?.providerPayTo !== providerPayTo ||
+    paid.payment?.snowtraceUrl !== snowtraceTxUrl(paymentTx) ||
+    paid.receipt?.snowtraceUrl !== snowtraceTxUrl(receiptTx)
   ) {
     throw new Error(`Unexpected paid smoke result: ${JSON.stringify(paid)}`);
   }
 
   process.stdout.write(
-    "MCP stdio search, get_facet (<username>/<facet-name>), default-deny invoke, and x402 settlement smoke passed.\n",
+    "MCP stdio search, get_facet (provider/facetName/version), default-deny invoke, and x402 settlement smoke passed.\n",
   );
 } finally {
   await client.close();

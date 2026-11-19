@@ -1,7 +1,11 @@
+import { createHash } from "node:crypto";
 import {
   FacetClient,
   SpendLedgerError,
   SpendPolicyError,
+  isValidFacetName,
+  isValidSemver,
+  isValidUsername,
   readFujiWalletStatus,
   redactSecrets,
   validateGrantAgainstChallenge,
@@ -20,6 +24,8 @@ import {
   type GatewayPaidResponse,
   type LocalBuyerRuntime,
 } from "./local-wallet.js";
+
+const MAX_RETAINED_PAYMENT_SIGNATURES = 256;
 
 export type McpPaymentErrorCode =
   | "PAYMENT_CHALLENGE_MISSING"
@@ -40,10 +46,68 @@ export class McpPaymentError extends Error {
   }
 }
 
+export interface FacetTargetRef {
+  provider: string;
+  facetName: string;
+  version: string;
+}
+
+function canonicalJson(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item !== null && typeof item === "object") {
+      const sorted: Record<string, unknown> = {};
+      for (const key of Object.keys(item).sort()) {
+        const child = normalize((item as Record<string, unknown>)[key]);
+        if (child !== undefined) sorted[key] = child;
+      }
+      return sorted;
+    }
+    return item;
+  };
+  const serialized = JSON.stringify(normalize(value));
+  if (serialized === undefined) {
+    throw new McpPaymentError(
+      "GATEWAY_REQUEST_FAILED",
+      "Unable to serialize invocation input canonically.",
+    );
+  }
+  return serialized;
+}
+
+function fingerprintInput(input: Record<string, unknown>): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+}
+
+function buildInvokePath(target: FacetTargetRef): string {
+  return `/v1/facets/${encodeURIComponent(target.provider)}/${encodeURIComponent(target.facetName)}/versions/${encodeURIComponent(target.version)}/invoke`;
+}
+
+function cacheRetainedSignature(
+  runtime: LocalBuyerRuntime,
+  runKey: string,
+  entry: {
+    inputFingerprint: string;
+    paymentHeader: string;
+    amountAtomic: string;
+  },
+): void {
+  if (
+    !runtime.retainedPaymentSignatures.has(runKey) &&
+    runtime.retainedPaymentSignatures.size >= MAX_RETAINED_PAYMENT_SIGNATURES
+  ) {
+    const oldestKey = runtime.retainedPaymentSignatures.keys().next().value;
+    if (oldestKey !== undefined) {
+      runtime.retainedPaymentSignatures.delete(oldestKey);
+    }
+  }
+  runtime.retainedPaymentSignatures.set(runKey, entry);
+}
+
 export function validateChallengeForGrant(
   header: string,
   grant: SpendPolicyGrant,
-  expectedVersionId: string,
+  expectedTarget: FacetTargetRef,
 ) {
   const required = decodePaymentRequiredHeader(header);
   const option = required.accepts[0];
@@ -71,10 +135,11 @@ export function validateChallengeForGrant(
     );
   }
 
-  if (resourcePath !== `/v1/facet-versions/${expectedVersionId}/invoke`) {
+  const expectedPath = buildInvokePath(expectedTarget);
+  if (resourcePath !== expectedPath) {
     throw new McpPaymentError(
       "PAYMENT_CHALLENGE_NOT_ALLOWED",
-      `Payment challenge resource path ${resourcePath} does not match expected version ${expectedVersionId}.`,
+      `Payment challenge resource path ${resourcePath} does not match expected target ${expectedPath}.`,
     );
   }
 
@@ -83,18 +148,21 @@ export function validateChallengeForGrant(
     networkParts[0] === "eip155" && /^[0-9]+$/u.test(networkParts[1] ?? "")
       ? Number(networkParts[1])
       : -1;
-  const challengeCreator =
-    typeof option.extra?.creatorPayTo === "string"
-      ? option.extra.creatorPayTo
+  const challengeProviderPayTo =
+    typeof option.extra?.providerPayTo === "string"
+      ? option.extra.providerPayTo
       : undefined;
 
   validateGrantAgainstChallenge(grant, {
-    facetId: grant.facetId,
-    facetVersionId: expectedVersionId,
+    provider: expectedTarget.provider,
+    facetName: expectedTarget.facetName,
+    version: expectedTarget.version,
     chainId,
     assetAddress: option.asset,
     settlementPayTo: option.payTo,
-    ...(challengeCreator ? { creatorPayTo: challengeCreator } : {}),
+    ...(challengeProviderPayTo
+      ? { providerPayTo: challengeProviderPayTo }
+      : {}),
     amountAtomic: option.amount,
   });
 
@@ -106,18 +174,36 @@ async function verifyCatalogPin(
   grant: SpendPolicyGrant,
 ): Promise<PublicFacetRecord> {
   const client = new FacetClient({ controlApiUrl: controlUrl });
-  const facet = (await client.getFacet(grant.facetId)) as
-    PublicFacetRecord | undefined;
+  let facet: PublicFacetRecord | undefined;
+  try {
+    facet = (await client.getFacet(
+      grant.provider,
+      grant.facetName,
+      grant.version,
+    )) as PublicFacetRecord | undefined;
+  } catch (error) {
+    throw new McpPaymentError(
+      "FACET_CATALOG_MISMATCH",
+      redactSecrets(
+        `Catalog lookup failed for ${grant.provider}/${grant.facetName}@${grant.version}: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+  }
   if (!facet) {
     throw new McpPaymentError(
       "FACET_CATALOG_MISMATCH",
-      `Catalog facet ${grant.facetId} is no longer available.`,
+      `Catalog facet ${grant.provider}/${grant.facetName}@${grant.version} is no longer available.`,
     );
   }
-  if (facet.versionId !== grant.versionId) {
+  if (
+    facet.provider !== grant.provider ||
+    facet.facetName !== grant.facetName ||
+    facet.version !== grant.version ||
+    facet.facetType !== grant.facetType
+  ) {
     throw new McpPaymentError(
       "FACET_CATALOG_MISMATCH",
-      `Catalog version ${facet.versionId} does not match granted immutable version ${grant.versionId}.`,
+      `Catalog record ${facet.provider}/${facet.facetName}@${facet.version} (${facet.facetType}) does not match granted immutable target ${grant.provider}/${grant.facetName}@${grant.version} (${grant.facetType}).`,
     );
   }
   if (!facet.pricing) {
@@ -126,16 +212,16 @@ async function verifyCatalogPin(
       "Catalog Facet is missing pricing metadata.",
     );
   }
-  if (facet.pricing.payTo.toLowerCase() !== grant.creatorPayTo.toLowerCase()) {
+  if (facet.pricing.payTo.toLowerCase() !== grant.providerPayTo.toLowerCase()) {
     throw new SpendPolicyError(
       "POLICY_RECIPIENT_MISMATCH",
-      `Catalog creator payTo ${facet.pricing.payTo} does not match pinned grant ${grant.creatorPayTo}.`,
+      `Catalog provider payTo ${facet.pricing.payTo} does not match pinned grant ${grant.providerPayTo}.`,
     );
   }
   const verified =
-    facet.facetType === "HOSTED_ACTOR"
+    facet.facetType === "ACTOR"
       ? facet.actorMeta?.registryVerified === true
-      : facet.facetType === "AUTONOMOUS_AGENT"
+      : facet.facetType === "AGENT"
         ? facet.agentMeta?.registryVerified === true
         : false;
   if (!verified) {
@@ -150,7 +236,9 @@ async function verifyCatalogPin(
 export interface InvokeWithPaymentOptions {
   controlUrl: string;
   gatewayUrl: string;
-  facetVersionId: string;
+  provider: string;
+  facetName: string;
+  version: string;
   input: Record<string, unknown>;
   idempotencyKey: string;
   runtime: LocalBuyerRuntime;
@@ -162,34 +250,60 @@ export async function invokeWithPayment(
   const {
     controlUrl,
     gatewayUrl,
-    facetVersionId,
+    provider,
+    facetName,
+    version,
     input,
     idempotencyKey,
     runtime,
   } = options;
 
-  const grant = await runtime.policyStore.findGrantByVersion(facetVersionId);
+  if (!isValidUsername(provider)) {
+    throw new SpendPolicyError(
+      "POLICY_INVALID",
+      `Invalid provider '${provider}'. Must be 8-16 lowercase hyphenated kebab-case characters.`,
+    );
+  }
+  if (!isValidFacetName(facetName)) {
+    throw new SpendPolicyError(
+      "POLICY_INVALID",
+      `Invalid facetName '${facetName}'. Must be 4-32 lowercase hyphenated kebab-case characters.`,
+    );
+  }
+  if (!isValidSemver(version)) {
+    throw new SpendPolicyError(
+      "POLICY_INVALID",
+      `Invalid version '${version}'. Expected SemVer MAJOR.MINOR.PATCH.`,
+    );
+  }
+
+  const grant = await runtime.policyStore.findGrant(
+    provider,
+    facetName,
+    version,
+  );
   if (!grant) {
     throw new SpendPolicyError(
       "POLICY_NOT_GRANTED",
-      `Default-deny: no spending policy granted for facetVersionId ${facetVersionId}. Run \`facet policy grant --facet ...\` first.`,
+      `Default-deny: no spending policy granted for ${provider}/${facetName}@${version}. Run \`facet policy grant --provider ${provider} --facet ${facetName} --version ${version}\` first.`,
     );
   }
 
   // Re-validate non-expired & non-revoked policy and confirm live catalog pin before any call.
   validateGrantAgainstChallenge(grant, {
-    facetId: grant.facetId,
-    facetVersionId,
+    provider: grant.provider,
+    facetName: grant.facetName,
+    version: grant.version,
     chainId: grant.chainId,
     assetAddress: grant.assetAddress,
     settlementPayTo: grant.settlementContract,
-    creatorPayTo: grant.creatorPayTo,
+    providerPayTo: grant.providerPayTo,
     amountAtomic: grant.pinnedPriceAtomic,
   });
   await verifyCatalogPin(controlUrl, grant);
 
   const url = new URL(
-    `/v1/facet-versions/${facetVersionId}/invoke`,
+    buildInvokePath({ provider, facetName, version }),
     gatewayUrl,
   );
   const headers = {
@@ -197,125 +311,177 @@ export async function invokeWithPayment(
     "idempotency-key": idempotencyKey,
   };
   const body = JSON.stringify({ input });
-
-  const first = await fetch(url, {
-    method: "POST",
-    headers,
-    body,
-    signal: AbortSignal.timeout(45_000),
-  });
+  const inputFingerprint = fingerprintInput(input);
+  const runKey = `${provider}/${facetName}@${version}:${idempotencyKey}`;
 
   const payerAddress = await runtime.walletStore.getWalletAddress();
-
-  if (first.status !== 402) {
-    const result = (await first.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
-    if (first.status === 202) {
-      const paymentObj = result.payment as
-        { status?: string; transaction?: string } | undefined;
-      return formatPendingInvokeResult({
-        ...(typeof result.runId === "string" ? { runId: result.runId } : {}),
-        facetVersionId,
-        idempotencyKey,
-        amountAtomic: grant.pinnedPriceAtomic,
-        paymentStatus: paymentObj?.status ?? "settlement_pending",
-        ...(paymentObj?.transaction
-          ? { transaction: paymentObj.transaction }
-          : {}),
-      });
-    }
-    if (!first.ok) {
-      const errCode = (result.error as { code?: string } | undefined)?.code;
-      if (first.status === 409 && errCode === "IDEMPOTENCY_CONFLICT") {
-        throw new McpPaymentError(
-          "IDEMPOTENCY_CONFLICT",
-          "Idempotency key reused with different input.",
-        );
-      }
-      throw new McpPaymentError(
-        "GATEWAY_REQUEST_FAILED",
-        redactSecrets(
-          `Gateway returned ${first.status}: ${JSON.stringify(result)}`,
-        ),
-      );
-    }
-    return formatSettledInvokeResult(result as unknown as GatewayPaidResponse, {
-      amountAtomic: grant.pinnedPriceAtomic,
-      payer: payerAddress,
-      creatorPayTo: grant.creatorPayTo,
-    });
-  }
-
-  const challenge = first.headers.get("PAYMENT-REQUIRED");
-  if (!challenge) {
-    throw new McpPaymentError(
-      "PAYMENT_CHALLENGE_MISSING",
-      "Gateway returned 402 without a PAYMENT-REQUIRED header.",
-    );
-  }
-
-  const required = validateChallengeForGrant(challenge, grant, facetVersionId);
-  const option = required.accepts[0]!;
-  const amountAtomic = option.amount;
-  const runKey = `${facetVersionId}:${idempotencyKey}`;
-
-  const existingEntries = await runtime.spendLedger.list({ facetVersionId });
+  const existingEntries = await runtime.spendLedger.list({
+    provider,
+    facetName,
+    version,
+  });
   const existingEntry = existingEntries.find((e) => e.runKey === runKey);
   const hadActiveEntry =
     existingEntry?.status === "PENDING" || existingEntry?.status === "SETTLED";
 
-  if (!hadActiveEntry) {
-    const walletStatus = await readFujiWalletStatus(payerAddress, {
-      client: runtime.fujiClient,
+  const retained = runtime.retainedPaymentSignatures.get(runKey);
+  let amountAtomic: string;
+  let paymentHeader: string;
+
+  if (
+    hadActiveEntry &&
+    retained &&
+    retained.inputFingerprint === inputFingerprint
+  ) {
+    amountAtomic = retained.amountAtomic;
+    paymentHeader = retained.paymentHeader;
+    await runtime.spendLedger.reserve(runKey, amountAtomic, {
+      dailyCapAtomic: grant.dailyCapAtomic,
+      maxPerRunAtomic: grant.maxPerRunAtomic,
+      provider,
+      facetName,
+      facetDisplayName: grant.facetDisplayName,
+      version,
+      facetType: grant.facetType,
+      payer: payerAddress,
+      providerPayTo: grant.providerPayTo,
     });
-    if (BigInt(walletStatus.balanceAtomic) < BigInt(amountAtomic)) {
-      throw new McpPaymentError(
-        "INSUFFICIENT_FUSD_BALANCE",
-        `Insufficient Fuji fUSD balance (${walletStatus.balanceAtomic} atomic) for required ${amountAtomic} atomic payment.`,
+  } else {
+    const first = await fetch(url, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(45_000),
+    });
+
+    if (first.status !== 402) {
+      const result = (await first.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+      >;
+      if (first.status === 202) {
+        const paymentObj = result.payment as
+          { status?: string; transaction?: string } | undefined;
+        return formatPendingInvokeResult({
+          ...(typeof result.runId === "string" ? { runId: result.runId } : {}),
+          provider,
+          facetName,
+          facetDisplayName: grant.facetDisplayName,
+          version,
+          facetType: grant.facetType,
+          idempotencyKey,
+          amountAtomic: grant.pinnedPriceAtomic,
+          paymentStatus: paymentObj?.status ?? "settlement_pending",
+          ...(paymentObj?.transaction
+            ? { transaction: paymentObj.transaction }
+            : {}),
+        });
+      }
+      if (!first.ok) {
+        const errCode = (result.error as { code?: string } | undefined)?.code;
+        if (first.status === 409 && errCode === "IDEMPOTENCY_CONFLICT") {
+          throw new McpPaymentError(
+            "IDEMPOTENCY_CONFLICT",
+            "Idempotency key reused with different input.",
+          );
+        }
+        throw new McpPaymentError(
+          "GATEWAY_REQUEST_FAILED",
+          redactSecrets(
+            `Gateway returned ${first.status}: ${JSON.stringify(result)}`,
+          ),
+        );
+      }
+      return formatSettledInvokeResult(
+        result as unknown as GatewayPaidResponse,
+        {
+          provider,
+          facetName,
+          facetDisplayName: grant.facetDisplayName,
+          version,
+          facetType: grant.facetType,
+          amountAtomic: grant.pinnedPriceAtomic,
+          payer: payerAddress,
+          providerPayTo: grant.providerPayTo,
+        },
       );
     }
-  }
 
-  await runtime.spendLedger.reserve(runKey, amountAtomic, {
-    dailyCapAtomic: grant.dailyCapAtomic,
-    maxPerRunAtomic: grant.maxPerRunAtomic,
-    facetId: grant.facetId,
-    facetVersionId,
-    payer: payerAddress,
-    creatorPayTo: grant.creatorPayTo,
-  });
+    const challenge = first.headers.get("PAYMENT-REQUIRED");
+    if (!challenge) {
+      throw new McpPaymentError(
+        "PAYMENT_CHALLENGE_MISSING",
+        "Gateway returned 402 without a PAYMENT-REQUIRED header.",
+      );
+    }
 
-  let paymentHeader: string;
-  try {
-    const account = await runtime.walletStore.loadWalletAccount();
-    const client = x402Client.fromConfig({
-      schemes: [
-        {
-          network: "eip155:43113",
-          client: new ExactEvmScheme(account),
-        },
-      ],
-      spendControls: {
-        allowedAssets: [
+    const required = validateChallengeForGrant(challenge, grant, {
+      provider,
+      facetName,
+      version,
+    });
+    const option = required.accepts[0]!;
+    amountAtomic = option.amount;
+
+    if (!hadActiveEntry) {
+      const walletStatus = await readFujiWalletStatus(payerAddress, {
+        client: runtime.fujiClient,
+      });
+      if (BigInt(walletStatus.balanceAtomic) < BigInt(amountAtomic)) {
+        throw new McpPaymentError(
+          "INSUFFICIENT_FUSD_BALANCE",
+          `Insufficient Fuji fUSD balance (${walletStatus.balanceAtomic} atomic) for required ${amountAtomic} atomic payment.`,
+        );
+      }
+    }
+
+    await runtime.spendLedger.reserve(runKey, amountAtomic, {
+      dailyCapAtomic: grant.dailyCapAtomic,
+      maxPerRunAtomic: grant.maxPerRunAtomic,
+      provider,
+      facetName,
+      facetDisplayName: grant.facetDisplayName,
+      version,
+      facetType: grant.facetType,
+      payer: payerAddress,
+      providerPayTo: grant.providerPayTo,
+    });
+
+    try {
+      const account = await runtime.walletStore.loadWalletAccount();
+      const client = x402Client.fromConfig({
+        schemes: [
           {
             network: "eip155:43113",
-            asset: grant.assetAddress,
-            maxAmountPerPayment: grant.maxPerRunAtomic,
+            client: new ExactEvmScheme(account),
           },
         ],
-      },
-    });
-    const payload = await client.createPaymentPayload(required);
-    paymentHeader = encodePaymentSignatureHeader(payload);
-  } catch (error) {
-    if (!hadActiveEntry) {
-      await runtime.spendLedger
-        .release(runKey, "SIGNING_FAILED")
-        .catch(() => {});
+        spendControls: {
+          allowedAssets: [
+            {
+              network: "eip155:43113",
+              asset: grant.assetAddress,
+              maxAmountPerPayment: grant.maxPerRunAtomic,
+            },
+          ],
+        },
+      });
+      const payload = await client.createPaymentPayload(required);
+      paymentHeader = encodePaymentSignatureHeader(payload);
+    } catch (error) {
+      if (!hadActiveEntry) {
+        await runtime.spendLedger
+          .release(runKey, "SIGNING_FAILED")
+          .catch(() => {});
+      }
+      throw error;
     }
-    throw error;
+
+    cacheRetainedSignature(runtime, runKey, {
+      inputFingerprint,
+      paymentHeader,
+      amountAtomic,
+    });
   }
 
   let paid: Response;
@@ -334,9 +500,13 @@ export async function invokeWithPayment(
       error instanceof Error &&
       (error.name === "TimeoutError" || error.name === "AbortError")
     ) {
-      // Keep reservation PENDING on uncertain timeout so daily cap stays locked until retry/reconcile.
+      // Keep reservation PENDING and cached PAYMENT-SIGNATURE on uncertain timeout so daily cap stays locked until retry/reconcile.
       return formatPendingInvokeResult({
-        facetVersionId,
+        provider,
+        facetName,
+        facetDisplayName: grant.facetDisplayName,
+        version,
+        facetType: grant.facetType,
         idempotencyKey,
         amountAtomic,
         paymentStatus: "timeout_pending",
@@ -355,7 +525,11 @@ export async function invokeWithPayment(
       { status?: string; transaction?: string } | undefined;
     return formatPendingInvokeResult({
       ...(typeof paidBody.runId === "string" ? { runId: paidBody.runId } : {}),
-      facetVersionId,
+      provider,
+      facetName,
+      facetDisplayName: grant.facetDisplayName,
+      version,
+      facetType: grant.facetType,
       idempotencyKey,
       amountAtomic,
       paymentStatus: paymentObj?.status ?? "settlement_pending",
@@ -369,6 +543,7 @@ export async function invokeWithPayment(
     const errCode = (paidBody.error as { code?: string } | undefined)?.code;
     if (errCode === "IDEMPOTENCY_CONFLICT") {
       if (!hadActiveEntry) {
+        runtime.retainedPaymentSignatures.delete(runKey);
         await runtime.spendLedger
           .release(runKey, "IDEMPOTENCY_CONFLICT")
           .catch(() => {});
@@ -386,6 +561,7 @@ export async function invokeWithPayment(
 
   if (!paid.ok) {
     if (!hadActiveEntry && (paid.status === 400 || paid.status === 402)) {
+      runtime.retainedPaymentSignatures.delete(runKey);
       await runtime.spendLedger
         .release(runKey, `HTTP_${paid.status}`)
         .catch(() => {});
@@ -404,7 +580,11 @@ export async function invokeWithPayment(
   if (!paymentTx || !receiptTx) {
     return formatPendingInvokeResult({
       runId: settled.runId,
-      facetVersionId,
+      provider,
+      facetName,
+      facetDisplayName: grant.facetDisplayName,
+      version,
+      facetType: grant.facetType,
       idempotencyKey,
       amountAtomic,
       paymentStatus: "receipt_pending",
@@ -416,9 +596,12 @@ export async function invokeWithPayment(
     await runtime.spendLedger.confirm(runKey, {
       paymentTxHash: paymentTx,
       receiptTxHash: receiptTx,
+      ...(settled.payment?.amountAtomic
+        ? { amountAtomic: settled.payment.amountAtomic }
+        : {}),
       runId: settled.runId,
       payer: settled.payment?.payer ?? payerAddress,
-      creatorPayTo: settled.payment?.creatorPayTo ?? grant.creatorPayTo,
+      providerPayTo: settled.payment?.providerPayTo ?? grant.providerPayTo,
     });
   } catch (error) {
     if (
@@ -430,8 +613,13 @@ export async function invokeWithPayment(
   }
 
   return formatSettledInvokeResult(settled, {
+    provider,
+    facetName,
+    facetDisplayName: grant.facetDisplayName,
+    version,
+    facetType: grant.facetType,
     amountAtomic,
     payer: payerAddress,
-    creatorPayTo: grant.creatorPayTo,
+    providerPayTo: grant.providerPayTo,
   });
 }

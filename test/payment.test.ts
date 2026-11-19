@@ -12,6 +12,9 @@ import {
   type FujiRpcClient,
   type PublicFacetRecord,
 } from "@facet-aex/cli";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { x402Client } from "@x402/core/client";
 import { encodePaymentRequiredHeader } from "@x402/core/http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLocalBuyerRuntime } from "../src/local-wallet.js";
@@ -19,12 +22,15 @@ import {
   invokeWithPayment,
   validateChallengeForGrant,
 } from "../src/payment.js";
+import { createFacetMcpServer } from "../src/server.js";
 
 const tempDirs: string[] = [];
 const TEST_PRIVATE_KEY = ("0x" + "7".repeat(64)) as `0x${string}`;
-const CREATOR_PAY_TO = "0x9265c1c87fC5fb3C72Dc68b4D3A005dE1E22C3cf" as const;
-const FACET_ID = "01a1e97a-90e0-7030-b565-91c9abc3857b";
-const VERSION_ID = "01a1e97a-90e0-7038-b9ff-4f8d2a599e04";
+const PROVIDER_PAY_TO = "0x9265c1c87fC5fb3C72Dc68b4D3A005dE1E22C3cf" as const;
+const PROVIDER = "tai-hung-dev";
+const FACET_NAME = "echo-actor";
+const FACET_DISPLAY_NAME = "Echo Actor";
+const VERSION = "1.0.0";
 const PUBLIC_ORIGIN = "https://facet.briandev.space";
 
 async function makeTempDir(): Promise<string> {
@@ -55,19 +61,17 @@ function verifiedCatalogFacet(
   overrides?: Partial<PublicFacetRecord>,
 ): PublicFacetRecord {
   return {
-    id: FACET_ID,
-    versionId: VERSION_ID,
-    slug: "echo-actor",
-    fullName: "taihung/echo-actor",
-    name: "Echo Actor",
-    displayVersion: "v1",
-    facetType: "HOSTED_ACTOR",
+    provider: PROVIDER,
+    facetName: FACET_NAME,
+    facetDisplayName: FACET_DISPLAY_NAME,
+    version: VERSION,
+    facetType: "ACTOR",
     pricing: {
       model: "PAY_PER_RUN",
       priceAtomic: "1000",
       assetAddress: FUSD_ASSET_ADDRESS,
       chainId: FUJI_CHAIN_ID,
-      payTo: CREATOR_PAY_TO,
+      payTo: PROVIDER_PAY_TO,
     },
     actorMeta: {
       runtime: "nodejs22-alpine-v1",
@@ -85,14 +89,14 @@ function makeChallengeHeader(overrides?: {
   payTo?: string;
   amount?: string;
   resourceUrl?: string;
-  creatorPayTo?: string;
+  providerPayTo?: string;
 }) {
   const required = {
     x402Version: 2,
     resource: {
       url:
         overrides?.resourceUrl ??
-        `${PUBLIC_ORIGIN}/v1/facet-versions/${VERSION_ID}/invoke?fingerprint=abc`,
+        `${PUBLIC_ORIGIN}/v1/facets/${PROVIDER}/${FACET_NAME}/versions/${VERSION}/invoke?fingerprint=abc`,
     },
     accepts: [
       {
@@ -105,8 +109,8 @@ function makeChallengeHeader(overrides?: {
         extra: {
           name: "FACET USD",
           version: "2",
-          ...(overrides?.creatorPayTo
-            ? { creatorPayTo: overrides.creatorPayTo }
+          ...(overrides?.providerPayTo
+            ? { providerPayTo: overrides.providerPayTo }
             : {}),
         },
       },
@@ -136,8 +140,6 @@ async function setupRuntime(options?: {
   const facet = verifiedCatalogFacet();
   await policyStore.grant({
     facet,
-    facetId: FACET_ID,
-    versionId: VERSION_ID,
     maxPerRunAtomic: options?.maxPerRunAtomic ?? "1000",
     dailyCapAtomic: options?.dailyCapAtomic ?? "2000",
     expiresAt: "2030-01-01T00:00:00Z",
@@ -157,13 +159,14 @@ async function setupRuntime(options?: {
 
 afterEach(async () => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
 });
 
-describe("MCP local-wallet x402 payment guard", () => {
-  it("completes 402 -> 200 with Snowtrace links, confirms ledger, and omits raw keys/signatures", async () => {
+describe("MCP local-wallet Option B x402 payment guard", () => {
+  it("completes 402 -> 200 with Snowtrace links, confirms ledger, and omits UUIDs, legacy creator names, and raw secrets", async () => {
     const { facet, runtime } = await setupRuntime();
     const payerAddress = await runtime.walletStore.getWalletAddress();
     const paymentTx = "0x" + "2".repeat(64);
@@ -172,21 +175,26 @@ describe("MCP local-wallet x402 payment guard", () => {
     let invokeAttempt = 0;
     const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
       const href = String(url);
-      if (href === `${PUBLIC_ORIGIN}/v1/catalog/facets/${FACET_ID}`) {
+      if (
+        href ===
+        `${PUBLIC_ORIGIN}/v1/catalog/facets/${PROVIDER}/${FACET_NAME}/versions/${VERSION}`
+      ) {
         return new Response(JSON.stringify({ facet }), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
       }
-      if (href === `${PUBLIC_ORIGIN}/v1/facet-versions/${VERSION_ID}/invoke`) {
+      if (
+        href ===
+        `${PUBLIC_ORIGIN}/v1/facets/${PROVIDER}/${FACET_NAME}/versions/${VERSION}/invoke`
+      ) {
         invokeAttempt += 1;
         if (invokeAttempt === 1) {
+          // Omit extra.providerPayTo to match gateway/src/payment.ts production challenge
           return new Response(JSON.stringify({ error: "payment_required" }), {
             status: 402,
             headers: {
-              "PAYMENT-REQUIRED": makeChallengeHeader({
-                creatorPayTo: CREATOR_PAY_TO,
-              }),
+              "PAYMENT-REQUIRED": makeChallengeHeader(),
             },
           });
         }
@@ -195,10 +203,11 @@ describe("MCP local-wallet x402 payment guard", () => {
         return new Response(
           JSON.stringify({
             runId: "b55dcf50-5e15-42df-9cf6-a480efd5157d",
-            facetVersionId: VERSION_ID,
-            facetFullName: "taihung/echo-actor",
-            displayVersion: "v1",
-            facetType: "HOSTED_ACTOR",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
             result: { items: [{ echo: "hi" }], count: 1 },
             dataset: [{ echo: "hi" }],
             usage: {
@@ -213,7 +222,7 @@ describe("MCP local-wallet x402 payment guard", () => {
               network: "eip155:43113",
               amountAtomic: "1000",
               payer: payerAddress,
-              creatorPayTo: CREATOR_PAY_TO,
+              providerPayTo: PROVIDER_PAY_TO,
             },
             receipt: {
               inputHash: "sha256:" + "e".repeat(64),
@@ -234,18 +243,26 @@ describe("MCP local-wallet x402 payment guard", () => {
     const out = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
-      facetVersionId: VERSION_ID,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
       input: { text: "hi" },
       idempotencyKey: "key-1",
       runtime,
     })) as Record<string, unknown>;
 
+    expect(out.status).toBe("SETTLED");
     expect(out.runId).toBe("b55dcf50-5e15-42df-9cf6-a480efd5157d");
+    expect(out.provider).toBe(PROVIDER);
+    expect(out.facetName).toBe(FACET_NAME);
+    expect(out.facetDisplayName).toBe(FACET_DISPLAY_NAME);
+    expect(out.version).toBe(VERSION);
+    expect(out.facetType).toBe("ACTOR");
     const payment = out.payment as Record<string, unknown>;
     const receipt = out.receipt as Record<string, unknown>;
     expect(payment.amountAtomic).toBe("1000");
     expect(payment.payer).toBe(payerAddress);
-    expect(payment.creatorPayTo).toBe(CREATOR_PAY_TO);
+    expect(payment.providerPayTo).toBe(PROVIDER_PAY_TO);
     expect(payment.snowtraceUrl).toBe(
       `https://testnet.snowtrace.io/tx/${paymentTx}`,
     );
@@ -253,17 +270,141 @@ describe("MCP local-wallet x402 payment guard", () => {
     expect(receipt.snowtraceUrl).toBe(
       `https://testnet.snowtrace.io/tx/${receiptTx}`,
     );
-    expect(JSON.stringify(out)).not.toContain(TEST_PRIVATE_KEY.slice(2));
-    expect(JSON.stringify(out)).not.toContain("PAYMENT-SIGNATURE");
+
+    const serialized = JSON.stringify(out);
+    expect(serialized).not.toContain(TEST_PRIVATE_KEY.slice(2));
+    expect(serialized).not.toMatch(
+      /facetId|versionId|facetVersionId|facetSlug|facetFullName|displayVersion|creatorPayTo|\bcreator\b|PAYMENT-SIGNATURE|HOSTED_ACTOR|AUTONOMOUS_AGENT|EXTERNAL_HTTP_API/u,
+    );
 
     const entries = await runtime.spendLedger.list();
     expect(entries).toHaveLength(1);
     expect(entries[0]?.status).toBe("SETTLED");
+    expect(entries[0]?.provider).toBe(PROVIDER);
+    expect(entries[0]?.providerPayTo).toBe(PROVIDER_PAY_TO);
   });
 
-  it("denies wrong chain, asset, fee-split payTo, creator, version, and amount before signing", async () => {
+  it("records actual PAY_PER_RESULT settled amount instead of max escrow deposit in SpendLedger", async () => {
+    const dir = await makeTempDir();
+    const walletStore = new WalletStore({
+      backend: createMemoryBackend(TEST_PRIVATE_KEY),
+    });
+    const policyStore = new PolicyStore({
+      filePath: join(dir, "policies.json"),
+    });
+    const spendLedger = new SpendLedger({
+      filePath: join(dir, "spend-ledger.json"),
+    });
+    const fujiClient: FujiRpcClient = {
+      getChainId: vi.fn(async () => 43113),
+      readFusdBalance: vi.fn(async () => 100_000n),
+    };
+    const payPerResultFacet = verifiedCatalogFacet({
+      pricing: {
+        model: "PAY_PER_RESULT",
+        priceAtomic: "500",
+        assetAddress: FUSD_ASSET_ADDRESS,
+        chainId: FUJI_CHAIN_ID,
+        payTo: PROVIDER_PAY_TO,
+      },
+    });
+    await policyStore.grant({
+      facet: payPerResultFacet,
+      maxPerRunAtomic: "10000",
+      dailyCapAtomic: "10000",
+      expiresAt: "2030-01-01T00:00:00Z",
+    });
+    const runtime = createLocalBuyerRuntime({
+      walletStore,
+      policyStore,
+      spendLedger,
+      fujiClient,
+    });
+    const payerAddress = await walletStore.getWalletAddress();
+    const paymentTx = "0x" + "8".repeat(64);
+    const receiptTx = "0x" + "4".repeat(64);
+
+    let attempt = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string) => {
+        if (String(url).includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet: payPerResultFacet }), {
+            status: 200,
+          });
+        }
+        attempt += 1;
+        if (attempt === 1) {
+          return new Response(JSON.stringify({ error: "payment_required" }), {
+            status: 402,
+            headers: {
+              "PAYMENT-REQUIRED": makeChallengeHeader({ amount: "10000" }),
+            },
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            runId: "cfa3c216-b707-47c8-b6aa-e53a3b9fa18c",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
+            result: { items: [{ title: "ok" }], count: 1 },
+            dataset: [{ title: "ok" }],
+            replayed: false,
+            payment: {
+              transaction: paymentTx,
+              network: "eip155:43113",
+              amountAtomic: "500",
+              payer: payerAddress,
+              providerPayTo: PROVIDER_PAY_TO,
+            },
+            receipt: {
+              inputHash: "sha256:" + "a".repeat(64),
+              outputHash: "sha256:" + "b".repeat(64),
+              itemCount: 1,
+              paymentTxHash: paymentTx,
+              receiptTxHash: receiptTx,
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const out = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 1 },
+      idempotencyKey: "key-pay-per-result",
+      runtime,
+    })) as { payment: { amountAtomic: string; amountFormatted: string } };
+
+    expect(out.payment.amountAtomic).toBe("500");
+    expect(out.payment.amountFormatted).toBe("0.000500");
+    const entries = await runtime.spendLedger.list();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.status).toBe("SETTLED");
+    expect(entries[0]?.amountAtomic).toBe("500");
+  });
+
+  it("denies invalid identifiers, wrong chain, asset, fee-split payTo, provider recipient, challenge resource path, amount, and ungranted versions before signing", async () => {
     const { runtime } = await setupRuntime();
-    const grant = (await runtime.policyStore.findGrant(FACET_ID, VERSION_ID))!;
+    const target = {
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+    };
+    const grant = (await runtime.policyStore.findGrant(
+      PROVIDER,
+      FACET_NAME,
+      VERSION,
+    ))!;
 
     function expectErrorCode(fn: () => unknown, code: string) {
       let caught: unknown;
@@ -275,12 +416,38 @@ describe("MCP local-wallet x402 payment guard", () => {
       expect(caught).toMatchObject({ code });
     }
 
+    await expect(
+      invokeWithPayment({
+        controlUrl: PUBLIC_ORIGIN,
+        gatewayUrl: PUBLIC_ORIGIN,
+        provider: PROVIDER,
+        facetName: FACET_NAME,
+        version: "v1",
+        input: { text: "hi" },
+        idempotencyKey: "key-bad-ver",
+        runtime,
+      }),
+    ).rejects.toMatchObject({ code: "POLICY_INVALID" });
+
+    await expect(
+      invokeWithPayment({
+        controlUrl: PUBLIC_ORIGIN,
+        gatewayUrl: PUBLIC_ORIGIN,
+        provider: "tai_hung",
+        facetName: FACET_NAME,
+        version: VERSION,
+        input: { text: "hi" },
+        idempotencyKey: "key-bad-provider",
+        runtime,
+      }),
+    ).rejects.toMatchObject({ code: "POLICY_INVALID" });
+
     expectErrorCode(
       () =>
         validateChallengeForGrant(
           makeChallengeHeader({ network: "eip155:43114" }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "POLICY_CHAIN_MISMATCH",
     );
@@ -292,7 +459,7 @@ describe("MCP local-wallet x402 payment guard", () => {
             asset: "0x0000000000000000000000000000000000000099",
           }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "POLICY_ASSET_MISMATCH",
     );
@@ -304,7 +471,7 @@ describe("MCP local-wallet x402 payment guard", () => {
             payTo: "0x0000000000000000000000000000000000000099",
           }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "POLICY_RECIPIENT_MISMATCH",
     );
@@ -313,10 +480,10 @@ describe("MCP local-wallet x402 payment guard", () => {
       () =>
         validateChallengeForGrant(
           makeChallengeHeader({
-            creatorPayTo: "0x0000000000000000000000000000000000000099",
+            providerPayTo: "0x0000000000000000000000000000000000000099",
           }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "POLICY_RECIPIENT_MISMATCH",
     );
@@ -325,10 +492,10 @@ describe("MCP local-wallet x402 payment guard", () => {
       () =>
         validateChallengeForGrant(
           makeChallengeHeader({
-            resourceUrl: `${PUBLIC_ORIGIN}/v1/facet-versions/00000000-0000-4000-8000-000000000099/invoke`,
+            resourceUrl: `${PUBLIC_ORIGIN}/v1/facets/${PROVIDER}/${FACET_NAME}/versions/1.0.1/invoke`,
           }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "PAYMENT_CHALLENGE_NOT_ALLOWED",
     );
@@ -338,17 +505,19 @@ describe("MCP local-wallet x402 payment guard", () => {
         validateChallengeForGrant(
           makeChallengeHeader({ amount: "1500" }),
           grant,
-          VERSION_ID,
+          target,
         ),
       "POLICY_MAX_PER_RUN_EXCEEDED",
     );
 
-    // Ungranted version denied (default-deny)
+    // Ungranted SemVer version denied (default-deny)
     await expect(
       invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
-        facetVersionId: "00000000-0000-4000-8000-000000000099",
+        provider: PROVIDER,
+        facetName: FACET_NAME,
+        version: "1.0.1",
         input: { text: "hi" },
         idempotencyKey: "key-denied",
         runtime,
@@ -373,7 +542,9 @@ describe("MCP local-wallet x402 payment guard", () => {
       invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
-        facetVersionId: VERSION_ID,
+        provider: PROVIDER,
+        facetName: FACET_NAME,
+        version: VERSION,
         input: { text: "hi" },
         idempotencyKey: "key-low-bal",
         runtime,
@@ -384,33 +555,36 @@ describe("MCP local-wallet x402 payment guard", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps reservation PENDING without false receipt on 202 and timeout, releases on 409 conflict, and replays without second charge", async () => {
+  it("retains and re-submits PAYMENT-SIGNATURE across 202 and timeout retries without re-signing, releases on 409 conflict, and replays without second charge", async () => {
     const { facet, runtime } = await setupRuntime({ dailyCapAtomic: "1000" });
     const paymentTx = "0x" + "5".repeat(64);
     const receiptTx = "0x" + "6".repeat(64);
+    const signSpy = vi.spyOn(x402Client.prototype, "createPaymentPayload");
+    const sentSignatures: string[] = [];
 
-    // 1) 202 pending keeps reservation PENDING and returns no receipt Snowtrace URL
     let mode: "202" | "timeout" | "409" | "200" = "202";
     const fetchMock = vi.fn(async (url: URL | string, init?: RequestInit) => {
       const href = String(url);
       if (href.includes("/v1/catalog/facets/")) {
         return new Response(JSON.stringify({ facet }), { status: 200 });
       }
-      const hasSig = Boolean(
-        (init?.headers as Record<string, string> | undefined)?.[
-          "PAYMENT-SIGNATURE"
-        ],
-      );
-      if (!hasSig) {
+      const sig = (init?.headers as Record<string, string> | undefined)?.[
+        "PAYMENT-SIGNATURE"
+      ];
+      if (!sig) {
         return new Response(JSON.stringify({ error: "payment_required" }), {
           status: 402,
           headers: { "PAYMENT-REQUIRED": makeChallengeHeader() },
         });
       }
+      sentSignatures.push(sig);
       if (mode === "202") {
         return new Response(
           JSON.stringify({
             runId: "b55dcf50-5e15-42df-9cf6-a480efd5157d",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            version: VERSION,
             payment: { status: "settlement_pending", transaction: paymentTx },
           }),
           { status: 202 },
@@ -428,7 +602,11 @@ describe("MCP local-wallet x402 payment guard", () => {
       return new Response(
         JSON.stringify({
           runId: "b55dcf50-5e15-42df-9cf6-a480efd5157d",
-          facetVersionId: VERSION_ID,
+          provider: PROVIDER,
+          facetName: FACET_NAME,
+          facetDisplayName: FACET_DISPLAY_NAME,
+          version: VERSION,
+          facetType: "ACTOR",
           result: { ok: true },
           dataset: [{ ok: true }],
           replayed: true,
@@ -437,7 +615,7 @@ describe("MCP local-wallet x402 payment guard", () => {
             network: "eip155:43113",
             amountAtomic: "1000",
             payer: await runtime.walletStore.getWalletAddress(),
-            creatorPayTo: CREATOR_PAY_TO,
+            providerPayTo: PROVIDER_PAY_TO,
           },
           receipt: {
             inputHash: "sha256:" + "a".repeat(64),
@@ -453,70 +631,95 @@ describe("MCP local-wallet x402 payment guard", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
+    // 1) Initial call hits 402 -> signs once -> receives 202 pending
     const pending202 = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
-      facetVersionId: VERSION_ID,
-      input: { text: "hi" },
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { b: 2, a: 1 },
       idempotencyKey: "key-pending",
       runtime,
     })) as Record<string, unknown>;
     expect(pending202.status).toBe("PENDING");
+    expect(pending202.provider).toBe(PROVIDER);
+    expect(pending202.facetName).toBe(FACET_NAME);
+    expect(pending202.version).toBe(VERSION);
     expect(pending202.receipt).toBeUndefined();
     expect((await runtime.spendLedger.list())[0]?.status).toBe("PENDING");
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(1);
 
     // Different key hits daily cap while key-pending is still PENDING
     await expect(
       invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
-        facetVersionId: VERSION_ID,
+        provider: PROVIDER,
+        facetName: FACET_NAME,
+        version: VERSION,
         input: { text: "other" },
         idempotencyKey: "key-second",
         runtime,
       }),
     ).rejects.toMatchObject({ code: "DAILY_CAP_EXCEEDED" });
 
-    // Timeout on retry with same key keeps PENDING
+    // 2) Timeout on retry with same key & canonically equivalent key ordering re-uses exact PAYMENT-SIGNATURE without re-signing
     mode = "timeout";
     const pendingTimeout = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
-      facetVersionId: VERSION_ID,
-      input: { text: "hi" },
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { a: 1, b: 2 },
       idempotencyKey: "key-pending",
       runtime,
     })) as Record<string, unknown>;
     expect(pendingTimeout.status).toBe("PENDING");
     expect((await runtime.spendLedger.list())[0]?.status).toBe("PENDING");
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(2);
+    expect(sentSignatures[1]).toBe(sentSignatures[0]);
 
-    // Same-key retry succeeds (200) without a second ledger reservation
+    // 3) Same-key retry succeeds (200) using exact retained PAYMENT-SIGNATURE & settles single ledger entry
     mode = "200";
     const settled = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
-      facetVersionId: VERSION_ID,
-      input: { text: "hi" },
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { a: 1, b: 2 },
       idempotencyKey: "key-pending",
       runtime,
     })) as Record<string, unknown>;
     expect(settled.replayed).toBe(true);
     expect(await runtime.spendLedger.list()).toHaveLength(1);
     expect((await runtime.spendLedger.list())[0]?.status).toBe("SETTLED");
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(3);
+    expect(sentSignatures[2]).toBe(sentSignatures[0]);
 
-    // Replay again after SETTLED still succeeds with 1 ledger entry
+    // 4) Replay again after SETTLED still uses retained PAYMENT-SIGNATURE without re-signing
     const settledReplay = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
-      facetVersionId: VERSION_ID,
-      input: { text: "hi" },
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { a: 1, b: 2 },
       idempotencyKey: "key-pending",
       runtime,
     })) as Record<string, unknown>;
     expect(settledReplay.replayed).toBe(true);
     expect(await runtime.spendLedger.list()).toHaveLength(1);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(4);
+    expect(sentSignatures[3]).toBe(sentSignatures[0]);
 
-    // 409 conflict on a new key (after releasing cap for test) releases reservation cleanly
+    // 5) 409 conflict on a new key releases reservation cleanly
     const { runtime: conflictRuntime, facet: conflictFacet } =
       await setupRuntime();
     vi.stubGlobal(
@@ -549,7 +752,9 @@ describe("MCP local-wallet x402 payment guard", () => {
       invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
-        facetVersionId: VERSION_ID,
+        provider: PROVIDER,
+        facetName: FACET_NAME,
+        version: VERSION,
         input: { text: "changed" },
         idempotencyKey: "key-conflict",
         runtime: conflictRuntime,
@@ -558,5 +763,95 @@ describe("MCP local-wallet x402 payment guard", () => {
     expect((await conflictRuntime.spendLedger.list())[0]?.status).toBe(
       "RELEASED",
     );
+  });
+
+  it("exposes Option B MCP tools (search_facets, get_facet, invoke_facet) over InMemoryTransport", async () => {
+    const { facet, runtime } = await setupRuntime();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string) => {
+        const href = String(url);
+        if (href.startsWith(`${PUBLIC_ORIGIN}/v1/catalog/facets?`)) {
+          expect(href).toContain("type=ACTOR");
+          expect(href).toContain("limit=5");
+          return new Response(JSON.stringify({ facets: [facet] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (
+          href ===
+          `${PUBLIC_ORIGIN}/v1/catalog/facets/${PROVIDER}/${FACET_NAME}/versions/${VERSION}`
+        ) {
+          return new Response(JSON.stringify({ facet }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      }),
+    );
+
+    const server = createFacetMcpServer({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      runtime,
+    });
+    const client = new Client({ name: "mcp-unit-client", version: "0.2.0" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    try {
+      const listed = await client.listTools();
+      const invokeTool = listed.tools.find((t) => t.name === "invoke_facet");
+      const getTool = listed.tools.find((t) => t.name === "get_facet");
+      const searchTool = listed.tools.find((t) => t.name === "search_facets");
+
+      expect(Object.keys(getTool?.inputSchema.properties ?? {})).toEqual(
+        expect.arrayContaining(["provider", "facetName", "version"]),
+      );
+      expect(Object.keys(invokeTool?.inputSchema.properties ?? {})).toEqual(
+        expect.arrayContaining([
+          "provider",
+          "facetName",
+          "version",
+          "input",
+          "idempotencyKey",
+        ]),
+      );
+      expect(JSON.stringify(searchTool?.inputSchema)).toContain('"ACTOR"');
+      expect(JSON.stringify(searchTool?.inputSchema)).not.toContain(
+        "HOSTED_ACTOR",
+      );
+
+      const searched = await client.callTool({
+        name: "search_facets",
+        arguments: { query: "echo", type: "ACTOR", limit: 5 },
+      });
+      expect(JSON.stringify(searched)).toContain(FACET_DISPLAY_NAME);
+
+      const fetched = await client.callTool({
+        name: "get_facet",
+        arguments: {
+          provider: PROVIDER,
+          facetName: FACET_NAME,
+          version: VERSION,
+        },
+      });
+      const fetchedContent = fetched.content as Array<{ text: string }>;
+      const fetchedBody = JSON.parse(fetchedContent[0]!.text) as {
+        facet: { provider: string; facetName: string; version: string };
+      };
+      expect(fetchedBody.facet.provider).toBe(PROVIDER);
+      expect(fetchedBody.facet.facetName).toBe(FACET_NAME);
+      expect(fetchedBody.facet.version).toBe(VERSION);
+    } finally {
+      await Promise.all([client.close(), server.close()]);
+    }
   });
 });

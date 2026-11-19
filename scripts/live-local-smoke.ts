@@ -9,10 +9,19 @@ try {
   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 }
 
-const facetId = process.env.FACET_DEMO_FACET_ID;
-const versionId = process.env.FACET_DEMO_VERSION_ID;
-if (!facetId || !versionId)
-  throw new Error("FACET_DEMO_FACET_ID and FACET_DEMO_VERSION_ID are required");
+const provider = process.env.FACET_DEMO_PROVIDER;
+const facetName = process.env.FACET_DEMO_FACET_NAME;
+const version = process.env.FACET_DEMO_VERSION;
+if (!provider || !facetName || !version) {
+  throw new Error(
+    "FACET_DEMO_PROVIDER, FACET_DEMO_FACET_NAME, and FACET_DEMO_VERSION are required",
+  );
+}
+
+const input = process.env.FACET_DEMO_INPUT_JSON
+  ? (JSON.parse(process.env.FACET_DEMO_INPUT_JSON) as Record<string, unknown>)
+  : { path: { owner: "octocat", repo: "Hello-World" } };
+
 const origin = process.env.FACET_ORIGIN ?? DEFAULT_FACET_ORIGIN;
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -24,7 +33,8 @@ const transport = new StdioClientTransport({
   },
   stderr: "pipe",
 });
-const client = new Client({ name: "facet-live-smoke", version: "0.1.0" });
+
+const client = new Client({ name: "facet-live-smoke", version: "0.2.0" });
 try {
   await client.connect(transport);
   const tools = (await client.listTools()).tools.map(({ name }) => name).sort();
@@ -32,19 +42,21 @@ try {
     throw new Error(`Unexpected tools: ${tools}`);
   const search = await client.callTool({
     name: "search_facets",
-    arguments: { query: "GitHub public repository" },
+    arguments: { query: facetName },
   });
-  if (!JSON.stringify(search).includes(facetId))
+  if (!JSON.stringify(search).includes(facetName))
     throw new Error("Published Facet not found by MCP search");
   const detail = await client.callTool({
     name: "get_facet",
-    arguments: { facetId },
+    arguments: { provider, facetName, version },
   });
-  if (!JSON.stringify(detail).includes(versionId))
+  if (!JSON.stringify(detail).includes(version))
     throw new Error("MCP detail returned wrong version");
   const args = {
-    facetVersionId: versionId,
-    input: { path: { owner: "octocat", repo: "Hello-World" } },
+    provider,
+    facetName,
+    version,
+    input,
     idempotencyKey:
       process.env.FACET_DEMO_IDEMPOTENCY_KEY ?? `mcp-live-${Date.now()}`,
   };
@@ -64,10 +76,7 @@ try {
           payment?: { transaction?: string; network?: string };
         })
       : undefined;
-  if (
-    !JSON.stringify(first).includes("octocat/Hello-World") ||
-    replayBody?.replayed !== true
-  ) {
+  if (first.isError || replay.isError || replayBody?.replayed !== true) {
     throw new Error(
       `MCP invocation/replay failed: ${JSON.stringify({ first, replay })}`,
     );
@@ -80,7 +89,7 @@ try {
     throw new Error("MCP paid result missing Fuji transaction reference");
   }
   process.stdout.write(
-    "MCP stdio search, detail, real GitHub invocation and replay passed.\n",
+    "MCP stdio search, detail, live invocation and replay passed.\n",
   );
 } finally {
   await client.close();
