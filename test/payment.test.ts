@@ -1039,15 +1039,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       twoOptionRequired,
       target,
       "PAY_PER_RESULT",
-    ) as unknown as {
-      narrowedRequired: {
-        accepts: Array<{ amount: string; extra: Record<string, unknown> }>;
-      };
-      selectedOption: { amount: string; extra: Record<string, unknown> };
-      pricingModel: PricingModel;
-      unitPriceAtomic: string;
-      maxItemsCap?: number;
-    };
+    );
     expect(validated.narrowedRequired.accepts).toHaveLength(1);
     expect(validated.selectedOption.amount).toBe("5000");
     expect(validated.selectedOption.extra.pricingModel).toBe("PAY_PER_RESULT");
@@ -1060,10 +1052,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       grant,
       twoOptionRequired,
       target,
-    ) as unknown as {
-      narrowedRequired: { accepts: Array<{ extra: Record<string, unknown> }> };
-      pricingModel: PricingModel;
-    };
+    );
     expect(defaultPrimary.narrowedRequired.accepts).toHaveLength(1);
     expect(defaultPrimary.pricingModel).toBe("PAY_PER_RUN");
 
@@ -1135,12 +1124,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       equalRequired,
       equalTarget,
       "PAY_PER_RESULT",
-    ) as unknown as {
-      narrowedRequired: { accepts: Array<{ extra: Record<string, unknown> }> };
-      pricingModel: PricingModel;
-      unitPriceAtomic: string;
-      maxItemsCap?: number;
-    };
+    );
     expect(disambiguated.narrowedRequired.accepts).toHaveLength(1);
     expect(disambiguated.narrowedRequired.accepts[0]?.extra.pricingModel).toBe(
       "PAY_PER_RESULT",
@@ -1392,7 +1376,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       }),
     );
 
-    const out = (await (invokeWithPayment as Function)({
+    const out = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -1517,7 +1501,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       }),
     );
 
-    const out = (await (invokeWithPayment as Function)({
+    const out = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -1921,7 +1905,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
     );
 
     await expect(
-      (invokeWithPayment as Function)({
+      invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
         provider: PROVIDER,
@@ -1949,7 +1933,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
     ).toBe(false);
 
     freshMode = "succeed";
-    const freshNext = (await (invokeWithPayment as Function)({
+    const freshNext = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -2067,7 +2051,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       }),
     );
 
-    const pending = (await (invokeWithPayment as Function)({
+    const pending = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -2082,7 +2066,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
 
     retryMode = "502";
     await expect(
-      (invokeWithPayment as Function)({
+      invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
         provider: PROVIDER,
@@ -2111,7 +2095,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
 
     // Daily cap (5000) is freed so a new run succeeds!
     retryMode = "200";
-    const afterRefundNext = (await (invokeWithPayment as Function)({
+    const afterRefundNext = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -2125,7 +2109,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
     expect(afterRefundNext.status).toBe("SETTLED");
   });
 
-  it("binds pricingModel into fingerprintInput and RetainedPaymentSignature so reusing an idempotencyKey with a different pricingModel does not replay the old signature", async () => {
+  it("rejects pricingModel switches on retained idempotencyKey without replaying the old RetainedPaymentSignature", async () => {
     const { facet, runtime } = await setupMultiPricingRuntime();
     const depositTx = "0x" + "1".repeat(64);
     let calls = 0;
@@ -2178,7 +2162,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       }),
     );
 
-    const firstPending = (await (invokeWithPayment as Function)({
+    const firstPending = (await invokeWithPayment({
       controlUrl: PUBLIC_ORIGIN,
       gatewayUrl: PUBLIC_ORIGIN,
       provider: PROVIDER,
@@ -2192,7 +2176,7 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
     expect(firstPending.status).toBe("PENDING");
 
     await expect(
-      (invokeWithPayment as Function)({
+      invokeWithPayment({
         controlUrl: PUBLIC_ORIGIN,
         gatewayUrl: PUBLIC_ORIGIN,
         provider: PROVIDER,
@@ -2481,5 +2465,436 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       refundAmountAtomic: "3500",
       itemCount: 3,
     });
+  });
+
+  it("reuses retained PAY_PER_RESULT signature across 202 retry omitting pricingModel on a dual-pricing grant without re-hitting 402", async () => {
+    const { facet, runtime } = await setupMultiPricingRuntime();
+    const payerAddress = await runtime.walletStore.getWalletAddress();
+    const paymentTx = "0x" + "2".repeat(64);
+    const depositTx = "0x" + "1".repeat(64);
+    const receiptTx = "0x" + "3".repeat(64);
+    const signSpy = vi.spyOn(x402Client.prototype, "createPaymentPayload");
+
+    let phase: "202" | "200" = "202";
+    let unsignedInvokeCalls = 0;
+    const sentSignatures: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string, init?: RequestInit) => {
+        if (String(url).includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet }), { status: 200 });
+        }
+        const sig = (init?.headers as Record<string, string> | undefined)?.[
+          "PAYMENT-SIGNATURE"
+        ];
+        if (!sig) {
+          unsignedInvokeCalls += 1;
+          return new Response(JSON.stringify({ error: "payment_required" }), {
+            status: 402,
+            headers: {
+              "PAYMENT-REQUIRED": makeMultiChallengeHeader([
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RUN",
+                  unitPriceAtomic: "1000",
+                  amount: "1000",
+                }),
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RESULT",
+                  unitPriceAtomic: "500",
+                  maxItemsCap: 10,
+                  amount: "5000",
+                }),
+              ]),
+            },
+          });
+        }
+        sentSignatures.push(sig);
+        if (phase === "202") {
+          return new Response(
+            JSON.stringify({
+              runId: "c11dcf50-5e15-42df-9cf6-a480efd5157a",
+              provider: PROVIDER,
+              facetName: FACET_NAME,
+              version: VERSION,
+              payment: { status: "escrow_pending", transaction: depositTx },
+            }),
+            { status: 202 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            runId: "c11dcf50-5e15-42df-9cf6-a480efd5157a",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
+            result: { items: [{ a: 1 }, { a: 2 }, { a: 3 }], count: 3 },
+            dataset: [{ a: 1 }, { a: 2 }, { a: 3 }],
+            usage: {
+              itemCount: 3,
+              durationMs: 20,
+              outputHash: "sha256:" + "d".repeat(64),
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+            replayed: true,
+            payment: {
+              transaction: paymentTx,
+              network: "eip155:43113",
+              pricingModel: "PAY_PER_RESULT",
+              amountAtomic: "1500",
+              unitPriceAtomic: "500",
+              maxItemsCap: 10,
+              depositedAmountAtomic: "5000",
+              refundAmountAtomic: "3500",
+              depositTxHash: depositTx,
+              payer: payerAddress,
+              providerPayTo: PROVIDER_PAY_TO,
+            },
+            receipt: {
+              inputHash: "sha256:" + "e".repeat(64),
+              outputHash: "sha256:" + "d".repeat(64),
+              itemCount: 3,
+              paymentTxHash: paymentTx,
+              receiptTxHash: receiptTx,
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const pending = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 3 },
+      pricingModel: "PAY_PER_RESULT",
+      idempotencyKey: "key-202-omit-retry",
+      runtime,
+    })) as { status: string };
+    expect(pending.status).toBe("PENDING");
+    expect(unsignedInvokeCalls).toBe(1);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+
+    // Retry omitting pricingModel (per formatPendingInvokeResult instructions)
+    phase = "200";
+    const settled = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 3 },
+      idempotencyKey: "key-202-omit-retry",
+      runtime,
+    })) as { status: string; payment: Record<string, unknown> };
+
+    expect(settled.status).toBe("SETTLED");
+    expect(settled.payment.pricingModel).toBe("PAY_PER_RESULT");
+    expect(settled.payment.amountAtomic).toBe("1500");
+    expect(unsignedInvokeCalls).toBe(1);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(2);
+    expect(sentSignatures[1]).toBe(sentSignatures[0]);
+  });
+
+  it("reuses retained signature across 202 retry when initial call omitted pricingModel and retry specifies resolved PAY_PER_RESULT", async () => {
+    const optionsWithResultPrimary: FacetPricingOption[] = [
+      {
+        model: "PAY_PER_RUN",
+        priceAtomic: "1000",
+        maxAmountAtomic: "1000",
+        assetAddress: FUSD_ASSET_ADDRESS,
+        chainId: FUJI_CHAIN_ID,
+        payTo: PROVIDER_PAY_TO,
+        isPrimary: false,
+      },
+      {
+        model: "PAY_PER_RESULT",
+        priceAtomic: "500",
+        maxItemsCap: 10,
+        maxAmountAtomic: "5000",
+        assetAddress: FUSD_ASSET_ADDRESS,
+        chainId: FUJI_CHAIN_ID,
+        payTo: PROVIDER_PAY_TO,
+        isPrimary: true,
+      },
+    ];
+    const { facet, runtime } = await setupMultiPricingRuntime({
+      facetOverrides: {
+        pricing: optionsWithResultPrimary[1],
+        pricingOptions: optionsWithResultPrimary,
+      },
+    });
+    const payerAddress = await runtime.walletStore.getWalletAddress();
+    const paymentTx = "0x" + "2".repeat(64);
+    const depositTx = "0x" + "1".repeat(64);
+    const receiptTx = "0x" + "3".repeat(64);
+    const signSpy = vi.spyOn(x402Client.prototype, "createPaymentPayload");
+
+    let phase: "202" | "200" = "202";
+    let unsignedInvokeCalls = 0;
+    const sentSignatures: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string, init?: RequestInit) => {
+        if (String(url).includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet }), { status: 200 });
+        }
+        const sig = (init?.headers as Record<string, string> | undefined)?.[
+          "PAYMENT-SIGNATURE"
+        ];
+        if (!sig) {
+          unsignedInvokeCalls += 1;
+          return new Response(JSON.stringify({ error: "payment_required" }), {
+            status: 402,
+            headers: {
+              "PAYMENT-REQUIRED": makeMultiChallengeHeader([
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RUN",
+                  unitPriceAtomic: "1000",
+                  amount: "1000",
+                }),
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RESULT",
+                  unitPriceAtomic: "500",
+                  maxItemsCap: 10,
+                  amount: "5000",
+                }),
+              ]),
+            },
+          });
+        }
+        sentSignatures.push(sig);
+        if (phase === "202") {
+          return new Response(
+            JSON.stringify({
+              runId: "c22dcf50-5e15-42df-9cf6-a480efd5157a",
+              provider: PROVIDER,
+              facetName: FACET_NAME,
+              version: VERSION,
+              payment: { status: "escrow_pending", transaction: depositTx },
+            }),
+            { status: 202 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            runId: "c22dcf50-5e15-42df-9cf6-a480efd5157a",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
+            result: { items: [{ a: 1 }], count: 1 },
+            dataset: [{ a: 1 }],
+            usage: {
+              itemCount: 1,
+              durationMs: 12,
+              outputHash: "sha256:" + "d".repeat(64),
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+            replayed: true,
+            payment: {
+              transaction: paymentTx,
+              network: "eip155:43113",
+              pricingModel: "PAY_PER_RESULT",
+              amountAtomic: "500",
+              unitPriceAtomic: "500",
+              maxItemsCap: 10,
+              depositedAmountAtomic: "5000",
+              refundAmountAtomic: "4500",
+              depositTxHash: depositTx,
+              payer: payerAddress,
+              providerPayTo: PROVIDER_PAY_TO,
+            },
+            receipt: {
+              inputHash: "sha256:" + "e".repeat(64),
+              outputHash: "sha256:" + "d".repeat(64),
+              itemCount: 1,
+              paymentTxHash: paymentTx,
+              receiptTxHash: receiptTx,
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const pending = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 1 },
+      idempotencyKey: "key-202-explicit-retry",
+      runtime,
+    })) as { status: string };
+    expect(pending.status).toBe("PENDING");
+    expect(unsignedInvokeCalls).toBe(1);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+
+    // Retry explicitly specifying resolved PAY_PER_RESULT
+    phase = "200";
+    const settled = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 1 },
+      pricingModel: "PAY_PER_RESULT",
+      idempotencyKey: "key-202-explicit-retry",
+      runtime,
+    })) as { status: string; payment: Record<string, unknown> };
+
+    expect(settled.status).toBe("SETTLED");
+    expect(settled.payment.pricingModel).toBe("PAY_PER_RESULT");
+    expect(settled.payment.amountAtomic).toBe("500");
+    expect(unsignedInvokeCalls).toBe(1);
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(sentSignatures).toHaveLength(2);
+    expect(sentSignatures[1]).toBe(sentSignatures[0]);
+  });
+
+  it("preserves existingEntry.pricingModel in 402 challenge selection on cold-cache retry omitting pricingModel", async () => {
+    const { facet, runtime } = await setupMultiPricingRuntime();
+    const payerAddress = await runtime.walletStore.getWalletAddress();
+    const paymentTx = "0x" + "2".repeat(64);
+    const depositTx = "0x" + "1".repeat(64);
+    const receiptTx = "0x" + "3".repeat(64);
+    const signSpy = vi.spyOn(x402Client.prototype, "createPaymentPayload");
+
+    let phase: "202" | "cold402" = "202";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string, init?: RequestInit) => {
+        if (String(url).includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet }), { status: 200 });
+        }
+        const sig = (init?.headers as Record<string, string> | undefined)?.[
+          "PAYMENT-SIGNATURE"
+        ];
+        if (!sig) {
+          return new Response(JSON.stringify({ error: "payment_required" }), {
+            status: 402,
+            headers: {
+              "PAYMENT-REQUIRED": makeMultiChallengeHeader([
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RUN",
+                  unitPriceAtomic: "1000",
+                  amount: "1000",
+                }),
+                makeAcceptEntry({
+                  pricingModel: "PAY_PER_RESULT",
+                  unitPriceAtomic: "500",
+                  maxItemsCap: 10,
+                  amount: "5000",
+                }),
+              ]),
+            },
+          });
+        }
+        if (phase === "202") {
+          return new Response(
+            JSON.stringify({
+              runId: "c33dcf50-5e15-42df-9cf6-a480efd5157a",
+              provider: PROVIDER,
+              facetName: FACET_NAME,
+              version: VERSION,
+              payment: { status: "escrow_pending", transaction: depositTx },
+            }),
+            { status: 202 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            runId: "c33dcf50-5e15-42df-9cf6-a480efd5157a",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
+            result: { items: [{ a: 1 }, { a: 2 }], count: 2 },
+            dataset: [{ a: 1 }, { a: 2 }],
+            usage: {
+              itemCount: 2,
+              durationMs: 14,
+              outputHash: "sha256:" + "d".repeat(64),
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+            replayed: false,
+            payment: {
+              transaction: paymentTx,
+              network: "eip155:43113",
+              pricingModel: "PAY_PER_RESULT",
+              amountAtomic: "1000",
+              unitPriceAtomic: "500",
+              maxItemsCap: 10,
+              depositedAmountAtomic: "5000",
+              refundAmountAtomic: "4000",
+              depositTxHash: depositTx,
+              payer: payerAddress,
+              providerPayTo: PROVIDER_PAY_TO,
+            },
+            receipt: {
+              inputHash: "sha256:" + "e".repeat(64),
+              outputHash: "sha256:" + "d".repeat(64),
+              itemCount: 2,
+              paymentTxHash: paymentTx,
+              receiptTxHash: receiptTx,
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const pending = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 2 },
+      pricingModel: "PAY_PER_RESULT",
+      idempotencyKey: "key-cold-402-preserve",
+      runtime,
+    })) as { status: string };
+    expect(pending.status).toBe("PENDING");
+
+    // Evict retained signature cache (simulating restart) and hit 402 again without pricingModel
+    runtime.retainedPaymentSignatures.clear();
+    phase = "cold402";
+
+    const settled = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 2 },
+      idempotencyKey: "key-cold-402-preserve",
+      runtime,
+    })) as { status: string; payment: Record<string, unknown> };
+
+    expect(settled.status).toBe("SETTLED");
+    expect(settled.payment.pricingModel).toBe("PAY_PER_RESULT");
+    expect(settled.payment.amountAtomic).toBe("1000");
+    expect(signSpy).toHaveBeenCalledTimes(2);
+    const secondSignedRequired = signSpy.mock.calls[1]![0] as {
+      accepts: Array<{ extra?: Record<string, unknown> }>;
+    };
+    expect(secondSignedRequired.accepts).toHaveLength(1);
+    expect(secondSignedRequired.accepts[0]?.extra?.pricingModel).toBe(
+      "PAY_PER_RESULT",
+    );
   });
 });

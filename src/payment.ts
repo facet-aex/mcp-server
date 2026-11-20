@@ -89,18 +89,8 @@ function canonicalJson(value: unknown): string {
   return serialized;
 }
 
-function fingerprintInput(
-  input: Record<string, unknown>,
-  pricingModel?: PricingModel,
-): string {
-  return createHash("sha256")
-    .update(
-      canonicalJson({
-        input,
-        ...(pricingModel ? { pricingModel } : {}),
-      }),
-    )
-    .digest("hex");
+function fingerprintInput(input: Record<string, unknown>): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex");
 }
 
 function buildInvokePath(target: FacetTargetRef): string {
@@ -112,7 +102,7 @@ function cacheRetainedSignature(
   runKey: string,
   entry: {
     inputFingerprint: string;
-    pricingModel?: PricingModel;
+    pricingModel: PricingModel;
     paymentHeader: string;
     amountAtomic: string;
   },
@@ -768,7 +758,7 @@ export async function invokeWithPayment(
     input,
     ...(pricingModel ? { pricingModel } : {}),
   });
-  const inputFingerprint = fingerprintInput(input, pricingModel);
+  const inputFingerprint = fingerprintInput(input);
   const runKey = `${provider}/${facetName}@${version}:${idempotencyKey}`;
 
   const payerAddress = await runtime.walletStore.getWalletAddress();
@@ -792,9 +782,10 @@ export async function invokeWithPayment(
     hadActiveEntry &&
     retained &&
     retained.inputFingerprint === inputFingerprint &&
-    (!pricingModel ||
-      !retained.pricingModel ||
-      retained.pricingModel === pricingModel)
+    (!pricingModel || retained.pricingModel === pricingModel) &&
+    (!existingEntry?.pricingModel ||
+      !pricingModel ||
+      existingEntry.pricingModel === pricingModel)
   ) {
     amountAtomic = retained.amountAtomic;
     paymentHeader = retained.paymentHeader;
@@ -910,7 +901,7 @@ export async function invokeWithPayment(
         facetName,
         version,
       },
-      pricingModel,
+      pricingModel ?? existingEntry?.pricingModel,
     );
     amountAtomic = validatedChallenge.selectedOption.amount;
     selectedPricingModel = validatedChallenge.pricingModel;
