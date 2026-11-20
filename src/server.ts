@@ -67,7 +67,7 @@ export function createFacetMcpServer(config: FacetMcpServerConfig = {}) {
     { name: "facet", version: "0.2.0" },
     {
       instructions:
-        "FACET is a multi-modal capability marketplace on Avalanche unifying ACTOR (Docker Actors returning structured Datasets), AGENT (ERC-8004 bound A2A Agents), and API services. First call search_facets with a short intent phrase (optionally filtering by type API|ACTOR|AGENT or category), then call get_facet with { provider, facetName, version? } to inspect its inputSchema, outputSchema, pricing, actorMeta.imageDigest or agentMeta.erc8004TokenId. Construct input matching inputSchema and call invoke_facet with { provider, facetName, version, input, idempotencyKey? }, which enforces local operator spending policies and Fuji testnet fUSD x402 payment before returning result, dataset, usage, payment, and on-chain receipt.",
+        "FACET is a multi-modal capability marketplace on Avalanche unifying ACTOR (Docker Actors returning structured Datasets), AGENT (ERC-8004 bound A2A Agents), and API services. First call search_facets with a short intent phrase (optionally filtering by type API|ACTOR|AGENT or category), then call get_facet with { provider, facetName, version? } to inspect its inputSchema, outputSchema, pricing, pricingOptions (PAY_PER_RUN and/or PAY_PER_RESULT TaskEscrow), apiMeta, actorMeta.imageDigest, or agentMeta.erc8004TokenId. Construct input matching inputSchema and call invoke_facet with { provider, facetName, version, input, pricingModel?, idempotencyKey? }, which enforces local operator spending policies and Avalanche fUSD x402 payment before returning result, dataset, usage, payment (including escrow deposit/refund details when PAY_PER_RESULT), and on-chain receipt.",
     },
   );
 
@@ -98,7 +98,7 @@ export function createFacetMcpServer(config: FacetMcpServerConfig = {}) {
     "get_facet",
     {
       description:
-        "Read a published Facet's inputSchema, outputSchema, pricing, actorMeta (imageDigest), and agentMeta (ERC-8004 Token ID) by separated provider, facetName, and optional SemVer version before invoking it.",
+        "Read a published Facet's inputSchema, outputSchema, pricing, pricingOptions, apiMeta, actorMeta (imageDigest), and agentMeta (ERC-8004 Token ID) by separated provider, facetName, and optional SemVer version before invoking it.",
       inputSchema: {
         provider: z.string().regex(USERNAME_REGEX),
         facetName: z.string().regex(FACET_NAME_REGEX),
@@ -120,16 +120,24 @@ export function createFacetMcpServer(config: FacetMcpServerConfig = {}) {
     "invoke_facet",
     {
       description:
-        "Execute a published Actor, ERC-8004 A2A Agent, or API with { provider, facetName, version, input }. Validates local operator policy, signs Fuji testnet fUSD x402 payment locally without exposing keys, and returns result, dataset, usage, payment, and Snowtrace receipt links.",
+        "Execute a published Actor, ERC-8004 A2A Agent, or verified API with { provider, facetName, version, input, pricingModel? }. Validates local operator policy, signs Avalanche fUSD x402 payment (PAY_PER_RUN or PAY_PER_RESULT escrow) locally without exposing keys, and returns result, dataset, usage, payment (with Snowtrace and escrow deposit/refund links), and on-chain receipt links.",
       inputSchema: {
         provider: z.string().regex(USERNAME_REGEX),
         facetName: z.string().regex(FACET_NAME_REGEX),
         version: z.string().regex(SEMVER_REGEX),
         input: z.record(z.string(), z.unknown()),
+        pricingModel: z.enum(["PAY_PER_RUN", "PAY_PER_RESULT"]).optional(),
         idempotencyKey: z.string().min(1).max(128).optional(),
       },
     },
-    async ({ provider, facetName, version, input, idempotencyKey }) => {
+    async ({
+      provider,
+      facetName,
+      version,
+      input,
+      pricingModel,
+      idempotencyKey,
+    }) => {
       const res = await invokeWithPayment({
         controlUrl,
         gatewayUrl,
@@ -137,6 +145,7 @@ export function createFacetMcpServer(config: FacetMcpServerConfig = {}) {
         facetName,
         version,
         input,
+        ...(pricingModel ? { pricingModel } : {}),
         idempotencyKey: idempotencyKey ?? randomUUID(),
         runtime,
       });
