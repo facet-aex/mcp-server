@@ -2340,4 +2340,146 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
       await Promise.all([client.close(), server.close()]);
     }
   });
+
+  it("uses existingEntry.pricingModel option fallbacks on first.ok replay after 202 and cache eviction on a multi-option grant", async () => {
+    const { facet, runtime } = await setupMultiPricingRuntime();
+    const payerAddress = await runtime.walletStore.getWalletAddress();
+    const paymentTx = "0x" + "2".repeat(64);
+    const depositTx = "0x" + "1".repeat(64);
+    const receiptTx = "0x" + "3".repeat(64);
+
+    let phase: "pending202" | "replay200" = "pending202";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: URL | string, init?: RequestInit) => {
+        if (String(url).includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet }), { status: 200 });
+        }
+        const sig = (init?.headers as Record<string, string> | undefined)?.[
+          "PAYMENT-SIGNATURE"
+        ];
+        if (phase === "pending202") {
+          if (!sig) {
+            return new Response(JSON.stringify({ error: "payment_required" }), {
+              status: 402,
+              headers: {
+                "PAYMENT-REQUIRED": makeMultiChallengeHeader([
+                  makeAcceptEntry({
+                    pricingModel: "PAY_PER_RUN",
+                    unitPriceAtomic: "1000",
+                    amount: "1000",
+                  }),
+                  makeAcceptEntry({
+                    pricingModel: "PAY_PER_RESULT",
+                    unitPriceAtomic: "500",
+                    maxItemsCap: 10,
+                    amount: "5000",
+                  }),
+                ]),
+              },
+            });
+          }
+          return new Response(
+            JSON.stringify({
+              runId: "b22dcf50-5e15-42df-9cf6-a480efd5157b",
+              provider: PROVIDER,
+              facetName: FACET_NAME,
+              version: VERSION,
+              payment: { status: "escrow_pending", transaction: depositTx },
+            }),
+            { status: 202 },
+          );
+        }
+
+        // After cache eviction, retry hits Gateway without PAYMENT-SIGNATURE and gets 200 replay
+        expect(sig).toBeUndefined();
+        return new Response(
+          JSON.stringify({
+            runId: "b22dcf50-5e15-42df-9cf6-a480efd5157b",
+            provider: PROVIDER,
+            facetName: FACET_NAME,
+            facetDisplayName: FACET_DISPLAY_NAME,
+            version: VERSION,
+            facetType: "ACTOR",
+            result: { items: [{ a: 1 }, { a: 2 }, { a: 3 }], count: 3 },
+            dataset: [{ a: 1 }, { a: 2 }, { a: 3 }],
+            usage: {
+              itemCount: 3,
+              durationMs: 15,
+              outputHash: "sha256:" + "d".repeat(64),
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+            replayed: true,
+            payment: {
+              transaction: paymentTx,
+              network: "eip155:43113",
+              pricingModel: "PAY_PER_RESULT",
+              amountAtomic: "1500",
+              payer: payerAddress,
+              providerPayTo: PROVIDER_PAY_TO,
+            },
+            receipt: {
+              inputHash: "sha256:" + "e".repeat(64),
+              outputHash: "sha256:" + "d".repeat(64),
+              itemCount: 3,
+              paymentTxHash: paymentTx,
+              receiptTxHash: receiptTx,
+              runnerSignature: "0x" + "ef".repeat(65),
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const pending = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 3 },
+      pricingModel: "PAY_PER_RESULT",
+      idempotencyKey: "key-first-ok-fallback",
+      runtime,
+    })) as { status: string };
+    expect(pending.status).toBe("PENDING");
+
+    // Simulate process restart / signature cache eviction and retry without pricingModel
+    runtime.retainedPaymentSignatures.clear();
+    phase = "replay200";
+
+    const settled = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { limit: 3 },
+      idempotencyKey: "key-first-ok-fallback",
+      runtime,
+    })) as {
+      status: string;
+      payment: Record<string, unknown>;
+    };
+
+    expect(settled.status).toBe("SETTLED");
+    expect(settled.payment.pricingModel).toBe("PAY_PER_RESULT");
+    expect(settled.payment.unitPriceAtomic).toBe("500");
+    expect(settled.payment.maxItemsCap).toBe(10);
+    expect(settled.payment.depositedAmountAtomic).toBe("5000");
+    expect(settled.payment.refundAmountAtomic).toBe("3500");
+    expect(settled.payment.amountAtomic).toBe("1500");
+
+    const entries = await runtime.spendLedger.list();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      status: "SETTLED",
+      pricingModel: "PAY_PER_RESULT",
+      amountAtomic: "1500",
+      depositedAmountAtomic: "5000",
+      refundAmountAtomic: "3500",
+      itemCount: 3,
+    });
+  });
 });

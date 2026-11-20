@@ -834,6 +834,11 @@ export async function invokeWithPayment(
         string,
         unknown
       >;
+      const effectiveModel =
+        existingEntry?.pricingModel ?? preflightOption.model;
+      const effectiveOption =
+        pinnedOptions.find((opt) => opt.model === effectiveModel) ??
+        preflightOption;
       if (first.status === 202) {
         const paymentObj = result.payment as
           { status?: string; transaction?: string } | undefined;
@@ -846,7 +851,7 @@ export async function invokeWithPayment(
           facetType: grant.facetType,
           idempotencyKey,
           amountAtomic:
-            existingEntry?.amountAtomic ?? preflightOption.maxAmountAtomic,
+            existingEntry?.amountAtomic ?? effectiveOption.maxAmountAtomic,
           paymentStatus: paymentObj?.status ?? "settlement_pending",
           ...(paymentObj?.transaction
             ? { transaction: paymentObj.transaction }
@@ -879,12 +884,11 @@ export async function invokeWithPayment(
         version,
         idempotencyKey,
         payerAddress,
-        selectedPricingModel:
-          existingEntry?.pricingModel ?? preflightOption.model,
-        selectedUnitPriceAtomic: preflightOption.priceAtomic,
-        selectedMaxItemsCap: preflightOption.maxItemsCap,
+        selectedPricingModel: effectiveModel,
+        selectedUnitPriceAtomic: effectiveOption.priceAtomic,
+        selectedMaxItemsCap: effectiveOption.maxItemsCap,
         amountAtomic:
-          existingEntry?.amountAtomic ?? preflightOption.maxAmountAtomic,
+          existingEntry?.amountAtomic ?? effectiveOption.maxAmountAtomic,
         shouldConfirmLedger: existingEntry?.status === "PENDING",
       });
     }
