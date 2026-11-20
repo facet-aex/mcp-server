@@ -64,7 +64,7 @@ export function createFacetMcpServer(config: FacetMcpServerConfig = {}) {
   const catalogClient = new FacetClient({ controlApiUrl: controlUrl });
 
   const server = new McpServer(
-    { name: "facet", version: "0.2.0" },
+    { name: "facet", version: "0.3.0" },
     {
       instructions:
         "FACET is a multi-modal capability marketplace on Avalanche unifying ACTOR (Docker Actors returning structured Datasets), AGENT (ERC-8004 bound A2A Agents), and API services. First call search_facets with a short intent phrase (optionally filtering by type API|ACTOR|AGENT or category), then call get_facet with { provider, facetName, version? } to inspect its inputSchema, outputSchema, pricing, pricingOptions (PAY_PER_RUN and/or PAY_PER_RESULT TaskEscrow), apiMeta, actorMeta.imageDigest, or agentMeta.erc8004TokenId. Construct input matching inputSchema and call invoke_facet with { provider, facetName, version, input, pricingModel?, idempotencyKey? }, which enforces local operator spending policies and Avalanche fUSD x402 payment before returning result, dataset, usage, payment (including escrow deposit/refund details when PAY_PER_RESULT), and on-chain receipt.",

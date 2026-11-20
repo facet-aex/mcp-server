@@ -1,7 +1,7 @@
 {
   "name": "@facet-aex/mcp-server",
-  "version": "0.2.0",
-  "description": "Local stdio MCP server for FACET capability discovery and policy-bounded Avalanche Fuji x402 invocation.",
+  "version": "0.3.0",
+  "description": "Local stdio MCP server for FACET capability discovery and policy-bounded Avalanche x402 invocation.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/facet-aex/mcp-server.git"
@@ -40,7 +40,7 @@
   },
   "packageManager": "npm@11.6.2",
   "dependencies": {
-    "@facet-aex/cli": "0.2.0",
+    "@facet-aex/cli": "0.3.0",
     "@modelcontextprotocol/sdk": "1.32.2",
     "@x402/core": "2.30.0",
     "@x402/evm": "2.30.0",
