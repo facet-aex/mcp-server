@@ -9,12 +9,14 @@ import {
   resolveProfileName,
   type FacetType,
   type FujiRpcClient,
+  type PricingModel,
 } from "@facet-aex/cli";
 
 export const SNOWTRACE_TX_BASE = "https://testnet.snowtrace.io/tx/" as const;
 
 export interface RetainedPaymentSignature {
   inputFingerprint: string;
+  pricingModel?: PricingModel;
   paymentHeader: string;
   amountAtomic: string;
 }
@@ -85,7 +87,13 @@ export interface GatewayPaidResponse {
   payment?: {
     transaction: string;
     network: string;
+    pricingModel?: PricingModel;
     amountAtomic?: string;
+    unitPriceAtomic?: string;
+    maxItemsCap?: number;
+    depositedAmountAtomic?: string;
+    refundAmountAtomic?: string;
+    depositTxHash?: string;
     payer?: string;
     providerPayTo?: string;
     payTo?: string;
@@ -108,14 +116,39 @@ export function formatSettledInvokeResult(
     facetDisplayName: string;
     version: string;
     facetType: FacetType;
+    pricingModel?: PricingModel;
+    unitPriceAtomic?: string;
+    maxItemsCap?: number;
+    depositedAmountAtomic?: string;
     amountAtomic: string;
     payer: string;
     providerPayTo: string;
   },
 ): Record<string, unknown> {
   const paymentTx = body.payment?.transaction;
+  const depositTx = body.payment?.depositTxHash;
   const receiptTx = body.receipt?.receiptTxHash;
   const amountAtomic = body.payment?.amountAtomic ?? fallback.amountAtomic;
+  const pricingModel = body.payment?.pricingModel ?? fallback.pricingModel;
+  const unitPriceAtomic =
+    body.payment?.unitPriceAtomic ??
+    (pricingModel === "PAY_PER_RESULT" ? fallback.unitPriceAtomic : undefined);
+  const maxItemsCap =
+    body.payment?.maxItemsCap ??
+    (pricingModel === "PAY_PER_RESULT" ? fallback.maxItemsCap : undefined);
+  const depositedAmountAtomic =
+    body.payment?.depositedAmountAtomic ??
+    fallback.depositedAmountAtomic ??
+    (pricingModel === "PAY_PER_RESULT" ? fallback.amountAtomic : undefined);
+  const computedRefundAtomic =
+    pricingModel === "PAY_PER_RESULT" && depositedAmountAtomic !== undefined
+      ? BigInt(depositedAmountAtomic) - BigInt(amountAtomic)
+      : undefined;
+  const refundAmountAtomic =
+    body.payment?.refundAmountAtomic ??
+    (computedRefundAtomic !== undefined && computedRefundAtomic >= 0n
+      ? computedRefundAtomic.toString()
+      : undefined);
   const payer = body.payment?.payer ?? fallback.payer;
   const providerPayTo = body.payment?.providerPayTo ?? fallback.providerPayTo;
 
@@ -134,8 +167,36 @@ export function formatSettledInvokeResult(
     payment: {
       transaction: paymentTx,
       network: body.payment?.network ?? "eip155:43113",
+      ...(pricingModel ? { pricingModel } : {}),
       amountAtomic,
       amountFormatted: formatFusdAtomic(BigInt(amountAtomic)),
+      ...(unitPriceAtomic !== undefined
+        ? {
+            unitPriceAtomic,
+            unitPriceFormatted: formatFusdAtomic(BigInt(unitPriceAtomic)),
+          }
+        : {}),
+      ...(maxItemsCap !== undefined ? { maxItemsCap } : {}),
+      ...(depositedAmountAtomic !== undefined
+        ? {
+            depositedAmountAtomic,
+            depositedAmountFormatted: formatFusdAtomic(
+              BigInt(depositedAmountAtomic),
+            ),
+          }
+        : {}),
+      ...(refundAmountAtomic !== undefined
+        ? {
+            refundAmountAtomic,
+            refundAmountFormatted: formatFusdAtomic(BigInt(refundAmountAtomic)),
+          }
+        : {}),
+      ...(depositTx
+        ? {
+            depositTxHash: depositTx,
+            depositSnowtraceUrl: snowtraceTxUrl(depositTx),
+          }
+        : {}),
       payer,
       providerPayTo,
       ...(paymentTx ? { snowtraceUrl: snowtraceTxUrl(paymentTx) } : {}),

@@ -3,12 +3,16 @@ import {
   FacetClient,
   SpendLedgerError,
   SpendPolicyError,
+  getGrantPricingOptions,
   isValidFacetName,
+  isValidPricingModel,
   isValidSemver,
   isValidUsername,
   readFujiWalletStatus,
   redactSecrets,
   validateGrantAgainstChallenge,
+  type PinnedPricingOption,
+  type PricingModel,
   type PublicFacetRecord,
   type SpendPolicyGrant,
 } from "@facet-aex/cli";
@@ -17,6 +21,7 @@ import {
   decodePaymentRequiredHeader,
   encodePaymentSignatureHeader,
 } from "@x402/core/http";
+import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
 import {
   formatPendingInvokeResult,
@@ -26,6 +31,7 @@ import {
 } from "./local-wallet.js";
 
 const MAX_RETAINED_PAYMENT_SIGNATURES = 256;
+const NON_NEGATIVE_ATOMIC_REGEX = /^(?:0|[1-9][0-9]*)$/u;
 
 export type McpPaymentErrorCode =
   | "PAYMENT_CHALLENGE_MISSING"
@@ -50,6 +56,14 @@ export interface FacetTargetRef {
   provider: string;
   facetName: string;
   version: string;
+}
+
+export interface ValidatedChallengeResult {
+  narrowedRequired: PaymentRequired;
+  selectedOption: PaymentRequirements;
+  pricingModel: PricingModel;
+  unitPriceAtomic: string;
+  maxItemsCap?: number;
 }
 
 function canonicalJson(value: unknown): string {
@@ -88,6 +102,7 @@ function cacheRetainedSignature(
   runKey: string,
   entry: {
     inputFingerprint: string;
+    pricingModel: PricingModel;
     paymentHeader: string;
     amountAtomic: string;
   },
@@ -104,24 +119,154 @@ function cacheRetainedSignature(
   runtime.retainedPaymentSignatures.set(runKey, entry);
 }
 
+function isFacetExactOption(option: PaymentRequirements | undefined): boolean {
+  return Boolean(
+    option &&
+    option.scheme === "exact" &&
+    option.extra?.name === "FACET USD" &&
+    option.extra?.version === "2",
+  );
+}
+
+function selectChallengeOption(
+  candidates: PaymentRequirements[],
+  grant: SpendPolicyGrant,
+  pinnedOptions: PinnedPricingOption[],
+  requestedPricingModel?: PricingModel,
+): PaymentRequirements {
+  const pinnedModels = new Set(pinnedOptions.map((opt) => opt.model));
+
+  if (candidates.length > 1) {
+    const seenModels = new Set<PricingModel>();
+    for (const candidate of candidates) {
+      const candidateModel = candidate.extra?.pricingModel;
+      if (
+        typeof candidateModel !== "string" ||
+        !isValidPricingModel(candidateModel)
+      ) {
+        throw new McpPaymentError(
+          "PAYMENT_CHALLENGE_NOT_ALLOWED",
+          "Gateway multi-option payment challenge entry is missing a valid pricingModel.",
+        );
+      }
+      if (seenModels.has(candidateModel)) {
+        throw new McpPaymentError(
+          "PAYMENT_CHALLENGE_NOT_ALLOWED",
+          `Gateway payment challenge contains duplicate pricingModel '${candidateModel}'.`,
+        );
+      }
+      seenModels.add(candidateModel);
+    }
+  } else {
+    const singleModel = candidates[0]?.extra?.pricingModel;
+    if (
+      singleModel !== undefined &&
+      (typeof singleModel !== "string" || !isValidPricingModel(singleModel))
+    ) {
+      throw new McpPaymentError(
+        "PAYMENT_CHALLENGE_NOT_ALLOWED",
+        "Gateway returned an unsupported pricingModel in x402 v2 payment challenge.",
+      );
+    }
+  }
+
+  if (requestedPricingModel !== undefined) {
+    if (!pinnedModels.has(requestedPricingModel)) {
+      throw new SpendPolicyError(
+        "POLICY_PRICE_MISMATCH",
+        `Pricing model ${requestedPricingModel} is not authorized in this spending policy grant.`,
+      );
+    }
+    const matched = candidates.find(
+      (opt) => opt.extra?.pricingModel === requestedPricingModel,
+    );
+    if (!matched) {
+      throw new McpPaymentError(
+        "PAYMENT_CHALLENGE_NOT_ALLOWED",
+        `Gateway payment challenge does not offer requested pricingModel '${requestedPricingModel}'.`,
+      );
+    }
+    return matched;
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0]!;
+  }
+
+  const grantedCandidates = candidates.filter((opt) =>
+    pinnedModels.has(opt.extra.pricingModel as PricingModel),
+  );
+  if (grantedCandidates.length === 0) {
+    throw new SpendPolicyError(
+      "POLICY_PRICE_MISMATCH",
+      "None of the Gateway pricing options are authorized in this spending policy grant.",
+    );
+  }
+  if (grantedCandidates.length === 1) {
+    return grantedCandidates[0]!;
+  }
+
+  const primaryMatch = grantedCandidates.find(
+    (opt) => opt.extra.pricingModel === grant.pricingModel,
+  );
+  if (!primaryMatch) {
+    throw new McpPaymentError(
+      "PAYMENT_CHALLENGE_NOT_ALLOWED",
+      "Gateway payment challenge offers multiple granted pricing options without a matching primary option.",
+    );
+  }
+  return primaryMatch;
+}
+
+export function validateChallengeForGrant(
+  grant: SpendPolicyGrant,
+  required: PaymentRequired | string,
+  expectedTarget: FacetTargetRef,
+  requestedPricingModel?: PricingModel,
+): ValidatedChallengeResult;
 export function validateChallengeForGrant(
   header: string,
   grant: SpendPolicyGrant,
   expectedTarget: FacetTargetRef,
-) {
-  const required = decodePaymentRequiredHeader(header);
-  const option = required.accepts[0];
+  requestedPricingModel?: PricingModel,
+): ValidatedChallengeResult;
+export function validateChallengeForGrant(
+  grantOrHeader: SpendPolicyGrant | string,
+  requiredOrGrant: PaymentRequired | string | SpendPolicyGrant,
+  expectedTarget: FacetTargetRef,
+  requestedPricingModel?: PricingModel,
+): ValidatedChallengeResult {
+  let grant: SpendPolicyGrant;
+  let required: PaymentRequired;
+  if (typeof grantOrHeader === "string") {
+    grant = requiredOrGrant as SpendPolicyGrant;
+    required = decodePaymentRequiredHeader(grantOrHeader);
+  } else {
+    grant = grantOrHeader;
+    required =
+      typeof requiredOrGrant === "string"
+        ? decodePaymentRequiredHeader(requiredOrGrant)
+        : (requiredOrGrant as PaymentRequired);
+  }
+
   if (
     required.x402Version !== 2 ||
-    required.accepts.length !== 1 ||
-    !option ||
-    option.scheme !== "exact" ||
-    option.extra?.name !== "FACET USD" ||
-    option.extra?.version !== "2"
+    !Array.isArray(required.accepts) ||
+    required.accepts.length < 1
   ) {
     throw new McpPaymentError(
       "PAYMENT_CHALLENGE_NOT_ALLOWED",
       "Gateway returned an unsupported x402 v2 payment challenge.",
+    );
+  }
+
+  if (
+    requestedPricingModel !== undefined &&
+    !isValidPricingModel(requestedPricingModel)
+  ) {
+    throw new SpendPolicyError(
+      "POLICY_INVALID",
+      `Invalid pricingModel '${String(requestedPricingModel)}'. Expected PAY_PER_RUN or PAY_PER_RESULT.`,
     );
   }
 
@@ -143,33 +288,181 @@ export function validateChallengeForGrant(
     );
   }
 
-  const networkParts = option.network.split(":");
+  const candidates = required.accepts.filter((option) =>
+    isFacetExactOption(option),
+  );
+  if (candidates.length === 0) {
+    throw new McpPaymentError(
+      "PAYMENT_CHALLENGE_NOT_ALLOWED",
+      "Gateway returned an unsupported x402 v2 payment challenge.",
+    );
+  }
+
+  const pinnedOptions = getGrantPricingOptions(grant);
+  const selectedOption = selectChallengeOption(
+    candidates,
+    grant,
+    pinnedOptions,
+    requestedPricingModel,
+  );
+
+  const networkParts = selectedOption.network.split(":");
   const chainId =
     networkParts[0] === "eip155" && /^[0-9]+$/u.test(networkParts[1] ?? "")
       ? Number(networkParts[1])
       : -1;
-  const challengeProviderPayTo =
-    typeof option.extra?.providerPayTo === "string"
-      ? option.extra.providerPayTo
+
+  const rawProviderPayTo = selectedOption.extra?.providerPayTo;
+  if (rawProviderPayTo !== undefined && typeof rawProviderPayTo !== "string") {
+    throw new SpendPolicyError(
+      "POLICY_RECIPIENT_MISMATCH",
+      "Payment challenge extra.providerPayTo must be an EVM address string.",
+    );
+  }
+
+  const rawPricingModel = selectedOption.extra?.pricingModel;
+  const challengePricingModel =
+    typeof rawPricingModel === "string"
+      ? (rawPricingModel as PricingModel)
       : undefined;
+
+  const rawUnitPrice = selectedOption.extra?.unitPriceAtomic;
+  if (rawUnitPrice !== undefined && typeof rawUnitPrice !== "string") {
+    throw new SpendPolicyError(
+      "POLICY_PRICE_MISMATCH",
+      "Payment challenge extra.unitPriceAtomic must be an atomic string.",
+    );
+  }
+
+  const rawMaxItemsCap = selectedOption.extra?.maxItemsCap;
+  if (rawMaxItemsCap !== undefined && typeof rawMaxItemsCap !== "number") {
+    throw new SpendPolicyError(
+      "POLICY_PRICE_MISMATCH",
+      "Payment challenge extra.maxItemsCap must be an integer.",
+    );
+  }
 
   validateGrantAgainstChallenge(grant, {
     provider: expectedTarget.provider,
     facetName: expectedTarget.facetName,
     version: expectedTarget.version,
     chainId,
-    assetAddress: option.asset,
-    settlementPayTo: option.payTo,
-    ...(challengeProviderPayTo
-      ? { providerPayTo: challengeProviderPayTo }
+    assetAddress: selectedOption.asset,
+    settlementPayTo: selectedOption.payTo,
+    ...(rawProviderPayTo !== undefined
+      ? { providerPayTo: rawProviderPayTo }
       : {}),
-    amountAtomic: option.amount,
+    amountAtomic: selectedOption.amount,
+    ...(challengePricingModel !== undefined
+      ? { pricingModel: challengePricingModel }
+      : {}),
+    ...(rawUnitPrice !== undefined ? { unitPriceAtomic: rawUnitPrice } : {}),
+    ...(rawMaxItemsCap !== undefined ? { maxItemsCap: rawMaxItemsCap } : {}),
   });
 
-  return required;
+  const matchedGrantOption =
+    (challengePricingModel
+      ? pinnedOptions.find((opt) => opt.model === challengePricingModel)
+      : undefined) ?? pinnedOptions[0]!;
+  const resolvedPricingModel =
+    challengePricingModel ?? matchedGrantOption.model;
+  const resolvedUnitPriceAtomic =
+    rawUnitPrice ?? matchedGrantOption.priceAtomic;
+  const resolvedMaxItemsCap =
+    rawMaxItemsCap !== undefined
+      ? rawMaxItemsCap
+      : matchedGrantOption.maxItemsCap;
+
+  const narrowedRequired: PaymentRequired = {
+    ...required,
+    accepts: [selectedOption],
+  };
+
+  return {
+    narrowedRequired,
+    selectedOption,
+    pricingModel: resolvedPricingModel,
+    unitPriceAtomic: resolvedUnitPriceAtomic,
+    ...(resolvedMaxItemsCap !== undefined
+      ? { maxItemsCap: resolvedMaxItemsCap }
+      : {}),
+  };
 }
 
-async function verifyCatalogPin(
+export function verifyCatalogPin(
+  facet: PublicFacetRecord,
+  grant: SpendPolicyGrant,
+): PublicFacetRecord {
+  if (
+    facet.provider !== grant.provider ||
+    facet.facetName !== grant.facetName ||
+    facet.version !== grant.version ||
+    facet.facetType !== grant.facetType
+  ) {
+    throw new McpPaymentError(
+      "FACET_CATALOG_MISMATCH",
+      `Catalog record ${facet.provider}/${facet.facetName}@${facet.version} (${facet.facetType}) does not match granted immutable target ${grant.provider}/${grant.facetName}@${grant.version} (${grant.facetType}).`,
+    );
+  }
+
+  const catalogPricingOptions =
+    Array.isArray(facet.pricingOptions) && facet.pricingOptions.length > 0
+      ? facet.pricingOptions
+      : facet.pricing
+        ? [facet.pricing]
+        : [];
+  if (catalogPricingOptions.length === 0) {
+    throw new McpPaymentError(
+      "FACET_CATALOG_MISMATCH",
+      "Catalog Facet is missing pricing metadata.",
+    );
+  }
+  for (const option of catalogPricingOptions) {
+    if (option.payTo.toLowerCase() !== grant.providerPayTo.toLowerCase()) {
+      throw new SpendPolicyError(
+        "POLICY_RECIPIENT_MISMATCH",
+        `Catalog provider payTo ${option.payTo} does not match pinned grant ${grant.providerPayTo}.`,
+      );
+    }
+  }
+  if (
+    facet.pricing &&
+    facet.pricing.payTo.toLowerCase() !== grant.providerPayTo.toLowerCase()
+  ) {
+    throw new SpendPolicyError(
+      "POLICY_RECIPIENT_MISMATCH",
+      `Catalog provider payTo ${facet.pricing.payTo} does not match pinned grant ${grant.providerPayTo}.`,
+    );
+  }
+
+  const registryMeta =
+    facet.facetType === "ACTOR"
+      ? facet.actorMeta
+      : facet.facetType === "AGENT"
+        ? facet.agentMeta
+        : facet.facetType === "API"
+          ? facet.apiMeta
+          : undefined;
+  if (registryMeta?.registryVerified !== true) {
+    throw new SpendPolicyError(
+      "UNVERIFIED_FACET_REGISTRY",
+      "Catalog Facet is not marked registryVerified on Avalanche.",
+    );
+  }
+  if (
+    !registryMeta.registryTxHash ||
+    registryMeta.registryTxHash.toLowerCase() !==
+      grant.registryTxHash.toLowerCase()
+  ) {
+    throw new McpPaymentError(
+      "FACET_CATALOG_MISMATCH",
+      `Catalog registryTxHash ${registryMeta.registryTxHash ?? "(missing)"} does not match pinned grant ${grant.registryTxHash}.`,
+    );
+  }
+  return facet;
+}
+
+async function fetchAndVerifyCatalogPin(
   controlUrl: string,
   grant: SpendPolicyGrant,
 ): Promise<PublicFacetRecord> {
@@ -195,42 +488,168 @@ async function verifyCatalogPin(
       `Catalog facet ${grant.provider}/${grant.facetName}@${grant.version} is no longer available.`,
     );
   }
-  if (
-    facet.provider !== grant.provider ||
-    facet.facetName !== grant.facetName ||
-    facet.version !== grant.version ||
-    facet.facetType !== grant.facetType
-  ) {
-    throw new McpPaymentError(
-      "FACET_CATALOG_MISMATCH",
-      `Catalog record ${facet.provider}/${facet.facetName}@${facet.version} (${facet.facetType}) does not match granted immutable target ${grant.provider}/${grant.facetName}@${grant.version} (${grant.facetType}).`,
-    );
+  return verifyCatalogPin(facet, grant);
+}
+
+async function releaseRefundIfConfirmed(
+  runtime: LocalBuyerRuntime,
+  runKey: string,
+  status: number,
+  body: Record<string, unknown>,
+): Promise<boolean> {
+  if (status !== 502) return false;
+  const paymentObj = body.payment as
+    | {
+        status?: string;
+        transaction?: string;
+        refundAmountAtomic?: string;
+      }
+    | undefined;
+  if (paymentObj?.status !== "refunded") return false;
+
+  runtime.retainedPaymentSignatures.delete(runKey);
+  await runtime.spendLedger
+    .release(runKey, "ESCROW_REFUNDED", {
+      ...(typeof paymentObj.transaction === "string" && paymentObj.transaction
+        ? { refundTxHash: paymentObj.transaction }
+        : {}),
+      ...(typeof paymentObj.refundAmountAtomic === "string" &&
+      NON_NEGATIVE_ATOMIC_REGEX.test(paymentObj.refundAmountAtomic)
+        ? { refundAmountAtomic: paymentObj.refundAmountAtomic }
+        : {}),
+    })
+    .catch(() => {});
+  return true;
+}
+
+async function confirmAndFormatSettled(params: {
+  runtime: LocalBuyerRuntime;
+  runKey: string;
+  settled: GatewayPaidResponse;
+  grant: SpendPolicyGrant;
+  provider: string;
+  facetName: string;
+  version: string;
+  idempotencyKey: string;
+  payerAddress: string;
+  selectedPricingModel: PricingModel;
+  selectedUnitPriceAtomic: string;
+  selectedMaxItemsCap?: number;
+  amountAtomic: string;
+  shouldConfirmLedger: boolean;
+}): Promise<Record<string, unknown>> {
+  const {
+    runtime,
+    runKey,
+    settled,
+    grant,
+    provider,
+    facetName,
+    version,
+    idempotencyKey,
+    payerAddress,
+    selectedPricingModel,
+    selectedUnitPriceAtomic,
+    selectedMaxItemsCap,
+    amountAtomic,
+    shouldConfirmLedger,
+  } = params;
+
+  const paymentTx = settled.payment?.transaction;
+  const receiptTx = settled.receipt?.receiptTxHash;
+  if (!paymentTx || !receiptTx) {
+    return formatPendingInvokeResult({
+      runId: settled.runId,
+      provider,
+      facetName,
+      facetDisplayName: grant.facetDisplayName,
+      version,
+      facetType: grant.facetType,
+      idempotencyKey,
+      amountAtomic,
+      paymentStatus: "receipt_pending",
+      ...(paymentTx ? { transaction: paymentTx } : {}),
+    });
   }
-  if (!facet.pricing) {
-    throw new McpPaymentError(
-      "FACET_CATALOG_MISMATCH",
-      "Catalog Facet is missing pricing metadata.",
-    );
+
+  const resolvedPricingModel =
+    settled.payment?.pricingModel ?? selectedPricingModel;
+  const resolvedDepositedAmountAtomic =
+    settled.payment?.depositedAmountAtomic ??
+    (resolvedPricingModel === "PAY_PER_RESULT" ? amountAtomic : undefined);
+  const settledAmountAtomic = settled.payment?.amountAtomic;
+  const resolvedRefundAmountAtomic =
+    settled.payment?.refundAmountAtomic ??
+    (resolvedPricingModel === "PAY_PER_RESULT" &&
+    resolvedDepositedAmountAtomic !== undefined &&
+    settledAmountAtomic !== undefined
+      ? (() => {
+          const diff =
+            BigInt(resolvedDepositedAmountAtomic) - BigInt(settledAmountAtomic);
+          return diff >= 0n ? diff.toString() : undefined;
+        })()
+      : undefined);
+  const resolvedItemCount =
+    settled.usage?.itemCount ?? settled.receipt?.itemCount;
+  const resolvedDepositTxHash = settled.payment?.depositTxHash;
+
+  if (shouldConfirmLedger) {
+    try {
+      await runtime.spendLedger.confirm(runKey, {
+        paymentTxHash: paymentTx,
+        receiptTxHash: receiptTx,
+        ...(resolvedDepositTxHash
+          ? { depositTxHash: resolvedDepositTxHash }
+          : {}),
+        ...(settledAmountAtomic !== undefined
+          ? { amountAtomic: settledAmountAtomic }
+          : {}),
+        pricingModel: resolvedPricingModel,
+        ...(resolvedDepositedAmountAtomic !== undefined
+          ? { depositedAmountAtomic: resolvedDepositedAmountAtomic }
+          : {}),
+        ...(resolvedRefundAmountAtomic !== undefined
+          ? { refundAmountAtomic: resolvedRefundAmountAtomic }
+          : {}),
+        ...(resolvedItemCount !== undefined
+          ? { itemCount: resolvedItemCount }
+          : {}),
+        runId: settled.runId,
+        payer: settled.payment?.payer ?? payerAddress,
+        providerPayTo: settled.payment?.providerPayTo ?? grant.providerPayTo,
+      });
+    } catch (error) {
+      if (
+        !(error instanceof SpendLedgerError) ||
+        error.code !== "RESERVATION_ALREADY_SETTLED"
+      ) {
+        throw error;
+      }
+    }
   }
-  if (facet.pricing.payTo.toLowerCase() !== grant.providerPayTo.toLowerCase()) {
-    throw new SpendPolicyError(
-      "POLICY_RECIPIENT_MISMATCH",
-      `Catalog provider payTo ${facet.pricing.payTo} does not match pinned grant ${grant.providerPayTo}.`,
-    );
-  }
-  const verified =
-    facet.facetType === "ACTOR"
-      ? facet.actorMeta?.registryVerified === true
-      : facet.facetType === "AGENT"
-        ? facet.agentMeta?.registryVerified === true
-        : false;
-  if (!verified) {
-    throw new SpendPolicyError(
-      "UNVERIFIED_FACET_REGISTRY",
-      "Catalog Facet is not marked registryVerified on Fuji.",
-    );
-  }
-  return facet;
+
+  return formatSettledInvokeResult(settled, {
+    provider,
+    facetName,
+    facetDisplayName: grant.facetDisplayName,
+    version,
+    facetType: grant.facetType,
+    pricingModel: resolvedPricingModel,
+    ...(resolvedPricingModel === "PAY_PER_RESULT"
+      ? {
+          unitPriceAtomic: selectedUnitPriceAtomic,
+          ...(selectedMaxItemsCap !== undefined
+            ? { maxItemsCap: selectedMaxItemsCap }
+            : {}),
+          ...(resolvedDepositedAmountAtomic !== undefined
+            ? { depositedAmountAtomic: resolvedDepositedAmountAtomic }
+            : {}),
+        }
+      : {}),
+    amountAtomic,
+    payer: payerAddress,
+    providerPayTo: grant.providerPayTo,
+  });
 }
 
 export interface InvokeWithPaymentOptions {
@@ -240,6 +659,7 @@ export interface InvokeWithPaymentOptions {
   facetName: string;
   version: string;
   input: Record<string, unknown>;
+  pricingModel?: PricingModel;
   idempotencyKey: string;
   runtime: LocalBuyerRuntime;
 }
@@ -254,6 +674,7 @@ export async function invokeWithPayment(
     facetName,
     version,
     input,
+    pricingModel,
     idempotencyKey,
     runtime,
   } = options;
@@ -276,6 +697,12 @@ export async function invokeWithPayment(
       `Invalid version '${version}'. Expected SemVer MAJOR.MINOR.PATCH.`,
     );
   }
+  if (pricingModel !== undefined && !isValidPricingModel(pricingModel)) {
+    throw new SpendPolicyError(
+      "POLICY_INVALID",
+      `Invalid pricingModel '${String(pricingModel)}'. Expected PAY_PER_RUN or PAY_PER_RESULT.`,
+    );
+  }
 
   const grant = await runtime.policyStore.findGrant(
     provider,
@@ -289,6 +716,18 @@ export async function invokeWithPayment(
     );
   }
 
+  const pinnedOptions = getGrantPricingOptions(grant);
+  const preflightOption = pricingModel
+    ? pinnedOptions.find((option) => option.model === pricingModel)
+    : (pinnedOptions.find((option) => option.model === grant.pricingModel) ??
+      pinnedOptions[0]);
+  if (!preflightOption) {
+    throw new SpendPolicyError(
+      "POLICY_PRICE_MISMATCH",
+      `Pricing model ${pricingModel} is not authorized in this spending policy grant.`,
+    );
+  }
+
   // Re-validate non-expired & non-revoked policy and confirm live catalog pin before any call.
   validateGrantAgainstChallenge(grant, {
     provider: grant.provider,
@@ -298,9 +737,14 @@ export async function invokeWithPayment(
     assetAddress: grant.assetAddress,
     settlementPayTo: grant.settlementContract,
     providerPayTo: grant.providerPayTo,
-    amountAtomic: grant.pinnedPriceAtomic,
+    pricingModel: preflightOption.model,
+    unitPriceAtomic: preflightOption.priceAtomic,
+    ...(preflightOption.maxItemsCap !== undefined
+      ? { maxItemsCap: preflightOption.maxItemsCap }
+      : {}),
+    amountAtomic: preflightOption.maxAmountAtomic,
   });
-  await verifyCatalogPin(controlUrl, grant);
+  await fetchAndVerifyCatalogPin(controlUrl, grant);
 
   const url = new URL(
     buildInvokePath({ provider, facetName, version }),
@@ -310,7 +754,10 @@ export async function invokeWithPayment(
     "content-type": "application/json",
     "idempotency-key": idempotencyKey,
   };
-  const body = JSON.stringify({ input });
+  const body = JSON.stringify({
+    input,
+    ...(pricingModel ? { pricingModel } : {}),
+  });
   const inputFingerprint = fingerprintInput(input);
   const runKey = `${provider}/${facetName}@${version}:${idempotencyKey}`;
 
@@ -327,14 +774,29 @@ export async function invokeWithPayment(
   const retained = runtime.retainedPaymentSignatures.get(runKey);
   let amountAtomic: string;
   let paymentHeader: string;
+  let selectedPricingModel: PricingModel;
+  let selectedUnitPriceAtomic: string;
+  let selectedMaxItemsCap: number | undefined;
 
   if (
     hadActiveEntry &&
     retained &&
-    retained.inputFingerprint === inputFingerprint
+    retained.inputFingerprint === inputFingerprint &&
+    (!pricingModel || retained.pricingModel === pricingModel) &&
+    (!existingEntry?.pricingModel ||
+      !pricingModel ||
+      existingEntry.pricingModel === pricingModel)
   ) {
     amountAtomic = retained.amountAtomic;
     paymentHeader = retained.paymentHeader;
+    selectedPricingModel =
+      retained.pricingModel ?? pricingModel ?? preflightOption.model;
+    const matchedGrantOption =
+      pinnedOptions.find((opt) => opt.model === selectedPricingModel) ??
+      preflightOption;
+    selectedUnitPriceAtomic = matchedGrantOption.priceAtomic;
+    selectedMaxItemsCap = matchedGrantOption.maxItemsCap;
+
     await runtime.spendLedger.reserve(runKey, amountAtomic, {
       dailyCapAtomic: grant.dailyCapAtomic,
       maxPerRunAtomic: grant.maxPerRunAtomic,
@@ -343,6 +805,10 @@ export async function invokeWithPayment(
       facetDisplayName: grant.facetDisplayName,
       version,
       facetType: grant.facetType,
+      pricingModel: selectedPricingModel,
+      ...(selectedPricingModel === "PAY_PER_RESULT"
+        ? { depositedAmountAtomic: amountAtomic }
+        : {}),
       payer: payerAddress,
       providerPayTo: grant.providerPayTo,
     });
@@ -359,6 +825,11 @@ export async function invokeWithPayment(
         string,
         unknown
       >;
+      const effectiveModel =
+        existingEntry?.pricingModel ?? preflightOption.model;
+      const effectiveOption =
+        pinnedOptions.find((opt) => opt.model === effectiveModel) ??
+        preflightOption;
       if (first.status === 202) {
         const paymentObj = result.payment as
           { status?: string; transaction?: string } | undefined;
@@ -370,7 +841,8 @@ export async function invokeWithPayment(
           version,
           facetType: grant.facetType,
           idempotencyKey,
-          amountAtomic: grant.pinnedPriceAtomic,
+          amountAtomic:
+            existingEntry?.amountAtomic ?? effectiveOption.maxAmountAtomic,
           paymentStatus: paymentObj?.status ?? "settlement_pending",
           ...(paymentObj?.transaction
             ? { transaction: paymentObj.transaction }
@@ -378,6 +850,7 @@ export async function invokeWithPayment(
         });
       }
       if (!first.ok) {
+        await releaseRefundIfConfirmed(runtime, runKey, first.status, result);
         const errCode = (result.error as { code?: string } | undefined)?.code;
         if (first.status === 409 && errCode === "IDEMPOTENCY_CONFLICT") {
           throw new McpPaymentError(
@@ -392,19 +865,23 @@ export async function invokeWithPayment(
           ),
         );
       }
-      return formatSettledInvokeResult(
-        result as unknown as GatewayPaidResponse,
-        {
-          provider,
-          facetName,
-          facetDisplayName: grant.facetDisplayName,
-          version,
-          facetType: grant.facetType,
-          amountAtomic: grant.pinnedPriceAtomic,
-          payer: payerAddress,
-          providerPayTo: grant.providerPayTo,
-        },
-      );
+      return confirmAndFormatSettled({
+        runtime,
+        runKey,
+        settled: result as unknown as GatewayPaidResponse,
+        grant,
+        provider,
+        facetName,
+        version,
+        idempotencyKey,
+        payerAddress,
+        selectedPricingModel: effectiveModel,
+        selectedUnitPriceAtomic: effectiveOption.priceAtomic,
+        selectedMaxItemsCap: effectiveOption.maxItemsCap,
+        amountAtomic:
+          existingEntry?.amountAtomic ?? effectiveOption.maxAmountAtomic,
+        shouldConfirmLedger: existingEntry?.status === "PENDING",
+      });
     }
 
     const challenge = first.headers.get("PAYMENT-REQUIRED");
@@ -415,13 +892,21 @@ export async function invokeWithPayment(
       );
     }
 
-    const required = validateChallengeForGrant(challenge, grant, {
-      provider,
-      facetName,
-      version,
-    });
-    const option = required.accepts[0]!;
-    amountAtomic = option.amount;
+    const decodedRequired = decodePaymentRequiredHeader(challenge);
+    const validatedChallenge = validateChallengeForGrant(
+      grant,
+      decodedRequired,
+      {
+        provider,
+        facetName,
+        version,
+      },
+      pricingModel ?? existingEntry?.pricingModel,
+    );
+    amountAtomic = validatedChallenge.selectedOption.amount;
+    selectedPricingModel = validatedChallenge.pricingModel;
+    selectedUnitPriceAtomic = validatedChallenge.unitPriceAtomic;
+    selectedMaxItemsCap = validatedChallenge.maxItemsCap;
 
     if (!hadActiveEntry) {
       const walletStatus = await readFujiWalletStatus(payerAddress, {
@@ -430,7 +915,7 @@ export async function invokeWithPayment(
       if (BigInt(walletStatus.balanceAtomic) < BigInt(amountAtomic)) {
         throw new McpPaymentError(
           "INSUFFICIENT_FUSD_BALANCE",
-          `Insufficient Fuji fUSD balance (${walletStatus.balanceAtomic} atomic) for required ${amountAtomic} atomic payment.`,
+          `Insufficient Avalanche fUSD balance (${walletStatus.balanceAtomic} atomic) for required ${amountAtomic} atomic payment.`,
         );
       }
     }
@@ -443,6 +928,10 @@ export async function invokeWithPayment(
       facetDisplayName: grant.facetDisplayName,
       version,
       facetType: grant.facetType,
+      pricingModel: selectedPricingModel,
+      ...(selectedPricingModel === "PAY_PER_RESULT"
+        ? { depositedAmountAtomic: amountAtomic }
+        : {}),
       payer: payerAddress,
       providerPayTo: grant.providerPayTo,
     });
@@ -466,7 +955,9 @@ export async function invokeWithPayment(
           ],
         },
       });
-      const payload = await client.createPaymentPayload(required);
+      const payload = await client.createPaymentPayload(
+        validatedChallenge.narrowedRequired,
+      );
       paymentHeader = encodePaymentSignatureHeader(payload);
     } catch (error) {
       if (!hadActiveEntry) {
@@ -479,6 +970,7 @@ export async function invokeWithPayment(
 
     cacheRetainedSignature(runtime, runKey, {
       inputFingerprint,
+      pricingModel: selectedPricingModel,
       paymentHeader,
       amountAtomic,
     });
@@ -560,7 +1052,17 @@ export async function invokeWithPayment(
   }
 
   if (!paid.ok) {
-    if (!hadActiveEntry && (paid.status === 400 || paid.status === 402)) {
+    const refunded = await releaseRefundIfConfirmed(
+      runtime,
+      runKey,
+      paid.status,
+      paidBody,
+    );
+    if (
+      !refunded &&
+      !hadActiveEntry &&
+      (paid.status === 400 || paid.status === 402)
+    ) {
       runtime.retainedPaymentSignatures.delete(runKey);
       await runtime.spendLedger
         .release(runKey, `HTTP_${paid.status}`)
@@ -574,52 +1076,20 @@ export async function invokeWithPayment(
     );
   }
 
-  const settled = paidBody as unknown as GatewayPaidResponse;
-  const paymentTx = settled.payment?.transaction;
-  const receiptTx = settled.receipt?.receiptTxHash;
-  if (!paymentTx || !receiptTx) {
-    return formatPendingInvokeResult({
-      runId: settled.runId,
-      provider,
-      facetName,
-      facetDisplayName: grant.facetDisplayName,
-      version,
-      facetType: grant.facetType,
-      idempotencyKey,
-      amountAtomic,
-      paymentStatus: "receipt_pending",
-      ...(paymentTx ? { transaction: paymentTx } : {}),
-    });
-  }
-
-  try {
-    await runtime.spendLedger.confirm(runKey, {
-      paymentTxHash: paymentTx,
-      receiptTxHash: receiptTx,
-      ...(settled.payment?.amountAtomic
-        ? { amountAtomic: settled.payment.amountAtomic }
-        : {}),
-      runId: settled.runId,
-      payer: settled.payment?.payer ?? payerAddress,
-      providerPayTo: settled.payment?.providerPayTo ?? grant.providerPayTo,
-    });
-  } catch (error) {
-    if (
-      !(error instanceof SpendLedgerError) ||
-      error.code !== "RESERVATION_ALREADY_SETTLED"
-    ) {
-      throw error;
-    }
-  }
-
-  return formatSettledInvokeResult(settled, {
+  return confirmAndFormatSettled({
+    runtime,
+    runKey,
+    settled: paidBody as unknown as GatewayPaidResponse,
+    grant,
     provider,
     facetName,
-    facetDisplayName: grant.facetDisplayName,
     version,
-    facetType: grant.facetType,
+    idempotencyKey,
+    payerAddress,
+    selectedPricingModel,
+    selectedUnitPriceAtomic,
+    selectedMaxItemsCap,
     amountAtomic,
-    payer: payerAddress,
-    providerPayTo: grant.providerPayTo,
+    shouldConfirmLedger: true,
   });
 }

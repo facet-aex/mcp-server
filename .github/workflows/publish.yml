@@ -18,20 +18,23 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: npm
-      - name: Ensure npm >= 11.5.1 for Trusted Publishing (OIDC)
-        run: npm install -g npm@latest
+      - name: Verify Node and bundled npm (>= 11.5.1 for OIDC)
+        run: node -v && npm -v
       - run: npm ci
       - run: npm run verify
       - name: Publish @facet-aex/mcp-server via Trusted Publishing (OIDC)
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            npm publish --dry-run --access public
+            npm publish --dry-run --access public --loglevel verbose
           else
-            npm publish --provenance --access public
+            npm publish --provenance --access public --loglevel verbose
           fi

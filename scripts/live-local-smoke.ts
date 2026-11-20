@@ -34,7 +34,7 @@ const transport = new StdioClientTransport({
   stderr: "pipe",
 });
 
-const client = new Client({ name: "facet-live-smoke", version: "0.2.0" });
+const client = new Client({ name: "facet-live-smoke", version: "0.3.0" });
 try {
   await client.connect(transport);
   const tools = (await client.listTools()).tools.map(({ name }) => name).sort();
@@ -86,7 +86,7 @@ try {
     (!/^0x[a-f0-9]{64}$/iu.test(replayBody?.payment?.transaction ?? "") ||
       replayBody?.payment?.network !== "eip155:43113")
   ) {
-    throw new Error("MCP paid result missing Fuji transaction reference");
+    throw new Error("MCP paid result missing Avalanche transaction reference");
   }
   process.stdout.write(
     "MCP stdio search, detail, live invocation and replay passed.\n",
