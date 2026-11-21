@@ -1,6 +1,6 @@
 {
   "name": "@facet-aex/mcp-server",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Local stdio MCP server for FACET capability discovery and policy-bounded Avalanche x402 invocation.",
   "repository": {
     "type": "git",

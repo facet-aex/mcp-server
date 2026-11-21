@@ -19,8 +19,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { x402Client } from "@x402/core/client";
 import {
   decodePaymentRequiredHeader,
+  decodePaymentSignatureHeader,
   encodePaymentRequiredHeader,
 } from "@x402/core/http";
+import { verifyTypedData, getAddress, type Hex } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLocalBuyerRuntime } from "../src/local-wallet.js";
 import {
@@ -2896,5 +2898,142 @@ describe("MCP multi-pricing, TaskEscrow, verified API, and 502 refund handling",
     expect(secondSignedRequired.accepts[0]?.extra?.pricingModel).toBe(
       "PAY_PER_RESULT",
     );
+  });
+
+  it("signs EIP-712 ReceiveWithAuthorization when challenge extra specifies it and surfaces escrowExpiresAt in 202 pending", async () => {
+    const { facet, runtime } = await setupMultiPricingRuntime();
+    const payerAddress = await runtime.walletStore.getWalletAddress();
+    const sentHeaders: string[] = [];
+    const expiresAt = "2027-01-15T08:15:00.000Z";
+    const runId = "019a1234-5678-7abc-8def-123456789abc";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/v1/catalog/facets/")) {
+          return new Response(JSON.stringify({ facet }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        const headers = new Headers(init?.headers);
+        const paymentSig = headers.get("PAYMENT-SIGNATURE");
+        if (!paymentSig) {
+          const header = encodePaymentRequiredHeader({
+            x402Version: 2,
+            resource: {
+              url: `${PUBLIC_ORIGIN}/v1/facets/${PROVIDER}/${FACET_NAME}/versions/${VERSION}/invoke`,
+              description: "Echo Actor",
+              mimeType: "application/json",
+            },
+            accepts: [
+              {
+                scheme: "exact",
+                network: "eip155:43113",
+                asset: FUSD_ASSET_ADDRESS,
+                amount: "5000",
+                payTo: FACET_FEE_SPLIT_ADDRESS,
+                maxTimeoutSeconds: 60,
+                extra: {
+                  name: "FACET USD",
+                  version: "2",
+                  authorizationType: "ReceiveWithAuthorization",
+                  pricingModel: "PAY_PER_RESULT",
+                  unitPriceAtomic: "500",
+                  maxItemsCap: 10,
+                  providerPayTo: PROVIDER_PAY_TO,
+                },
+              },
+            ],
+          });
+          return new Response(JSON.stringify({ error: "payment_required" }), {
+            status: 402,
+            headers: { "PAYMENT-REQUIRED": header },
+          });
+        }
+        sentHeaders.push(paymentSig);
+        return new Response(
+          JSON.stringify({
+            runId,
+            payment: {
+              status: "escrow_pending",
+              transaction: `0x${"a".repeat(64)}`,
+              escrowExpiresAt: expiresAt,
+            },
+          }),
+          { status: 202, headers: { "content-type": "application/json" } },
+        );
+      }),
+    );
+
+    const pending = (await invokeWithPayment({
+      controlUrl: PUBLIC_ORIGIN,
+      gatewayUrl: PUBLIC_ORIGIN,
+      provider: PROVIDER,
+      facetName: FACET_NAME,
+      version: VERSION,
+      input: { text: "hello" },
+      pricingModel: "PAY_PER_RESULT",
+      idempotencyKey: "key-receive-auth",
+      runtime,
+    })) as {
+      status: string;
+      runId?: string;
+      escrowExpiresAt?: string;
+      note?: string;
+      payment: Record<string, unknown>;
+    };
+
+    expect(pending.status).toBe("PENDING");
+    expect(pending.runId).toBe(runId);
+    expect(pending.escrowExpiresAt).toBe(expiresAt);
+    expect(pending.payment.escrowExpiresAt).toBe(expiresAt);
+    expect(pending.note).toContain(`facet escrow reclaim ${runId}`);
+
+    expect(sentHeaders).toHaveLength(1);
+    const decoded = decodePaymentSignatureHeader(sentHeaders[0]!);
+    const rawPayload = decoded.payload as {
+      authorization: {
+        from: string;
+        to: string;
+        value: string;
+        validAfter: string;
+        validBefore: string;
+        nonce: Hex;
+      };
+      signature: Hex;
+    };
+
+    const validReceiveSig = await verifyTypedData({
+      address: getAddress(payerAddress),
+      domain: {
+        name: "FACET USD",
+        version: "2",
+        chainId: FUJI_CHAIN_ID,
+        verifyingContract: getAddress(FUSD_ASSET_ADDRESS),
+      },
+      types: {
+        ReceiveWithAuthorization: [
+          { name: "from", type: "address" },
+          { name: "to", type: "address" },
+          { name: "value", type: "uint256" },
+          { name: "validAfter", type: "uint256" },
+          { name: "validBefore", type: "uint256" },
+          { name: "nonce", type: "bytes32" },
+        ],
+      },
+      primaryType: "ReceiveWithAuthorization",
+      message: {
+        from: getAddress(rawPayload.authorization.from),
+        to: getAddress(rawPayload.authorization.to),
+        value: BigInt(rawPayload.authorization.value),
+        validAfter: BigInt(rawPayload.authorization.validAfter),
+        validBefore: BigInt(rawPayload.authorization.validBefore),
+        nonce: rawPayload.authorization.nonce,
+      },
+      signature: rawPayload.signature,
+    });
+    expect(validReceiveSig).toBe(true);
   });
 });
