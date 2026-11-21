@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   FacetClient,
   SpendLedgerError,
@@ -21,14 +21,101 @@ import {
   decodePaymentRequiredHeader,
   encodePaymentSignatureHeader,
 } from "@x402/core/http";
-import type { PaymentRequired, PaymentRequirements } from "@x402/core/types";
+import type {
+  PaymentPayloadContext,
+  PaymentPayloadResult,
+  PaymentRequired,
+  PaymentRequirements,
+  SchemeNetworkClient,
+} from "@x402/core/types";
+import type { ClientEvmSigner } from "@x402/evm";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
+import { getAddress } from "viem";
 import {
   formatPendingInvokeResult,
   formatSettledInvokeResult,
   type GatewayPaidResponse,
   type LocalBuyerRuntime,
 } from "./local-wallet.js";
+
+const RECEIVE_WITH_AUTHORIZATION_TYPES = {
+  ReceiveWithAuthorization: [
+    { name: "from", type: "address" },
+    { name: "to", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+    { name: "nonce", type: "bytes32" },
+  ],
+};
+
+class ReceiveAuthorizationEvmScheme implements SchemeNetworkClient {
+  readonly scheme = "exact";
+  private readonly fallback: ExactEvmScheme;
+  readonly findDefaultAsset: ExactEvmScheme["findDefaultAsset"];
+
+  constructor(private readonly signer: ClientEvmSigner) {
+    this.fallback = new ExactEvmScheme(signer);
+    this.findDefaultAsset = this.fallback.findDefaultAsset.bind(this.fallback);
+  }
+
+  async createPaymentPayload(
+    x402Version: number,
+    paymentRequirements: PaymentRequirements,
+    context?: PaymentPayloadContext,
+  ): Promise<PaymentPayloadResult> {
+    if (
+      paymentRequirements.extra?.authorizationType !==
+      "ReceiveWithAuthorization"
+    ) {
+      return this.fallback.createPaymentPayload(
+        x402Version,
+        paymentRequirements,
+        context,
+      );
+    }
+    const extraName = paymentRequirements.extra?.name;
+    const extraVersion = paymentRequirements.extra?.version;
+    if (typeof extraName !== "string" || typeof extraVersion !== "string") {
+      throw new Error(
+        "EIP-712 domain parameters (name, version) are required in payment requirements",
+      );
+    }
+    const chainId = Number(paymentRequirements.network.split(":")[1]);
+    const nonce = `0x${randomBytes(32).toString("hex")}` as `0x${string}`;
+    const now = Math.floor(Date.now() / 1000);
+    const authorization = {
+      from: getAddress(this.signer.address),
+      to: getAddress(paymentRequirements.payTo),
+      value: paymentRequirements.amount,
+      validAfter: "0",
+      validBefore: String(now + paymentRequirements.maxTimeoutSeconds),
+      nonce,
+    };
+    const signature = await this.signer.signTypedData({
+      domain: {
+        name: extraName,
+        version: extraVersion,
+        chainId,
+        verifyingContract: getAddress(paymentRequirements.asset),
+      },
+      types: RECEIVE_WITH_AUTHORIZATION_TYPES,
+      primaryType: "ReceiveWithAuthorization",
+      message: {
+        from: authorization.from,
+        to: authorization.to,
+        value: BigInt(authorization.value),
+        validAfter: BigInt(authorization.validAfter),
+        validBefore: BigInt(authorization.validBefore),
+        nonce: authorization.nonce,
+      },
+    });
+    return {
+      x402Version,
+      payload: { authorization, signature },
+    };
+  }
+}
 
 const MAX_RETAINED_PAYMENT_SIGNATURES = 256;
 const NON_NEGATIVE_ATOMIC_REGEX = /^(?:0|[1-9][0-9]*)$/u;
@@ -832,7 +919,8 @@ export async function invokeWithPayment(
         preflightOption;
       if (first.status === 202) {
         const paymentObj = result.payment as
-          { status?: string; transaction?: string } | undefined;
+          | { status?: string; transaction?: string; escrowExpiresAt?: string }
+          | undefined;
         return formatPendingInvokeResult({
           ...(typeof result.runId === "string" ? { runId: result.runId } : {}),
           provider,
@@ -846,6 +934,9 @@ export async function invokeWithPayment(
           paymentStatus: paymentObj?.status ?? "settlement_pending",
           ...(paymentObj?.transaction
             ? { transaction: paymentObj.transaction }
+            : {}),
+          ...(typeof paymentObj?.escrowExpiresAt === "string"
+            ? { escrowExpiresAt: paymentObj.escrowExpiresAt }
             : {}),
         });
       }
@@ -942,7 +1033,7 @@ export async function invokeWithPayment(
         schemes: [
           {
             network: "eip155:43113",
-            client: new ExactEvmScheme(account),
+            client: new ReceiveAuthorizationEvmScheme(account),
           },
         ],
         spendControls: {
@@ -1014,7 +1105,8 @@ export async function invokeWithPayment(
 
   if (paid.status === 202) {
     const paymentObj = paidBody.payment as
-      { status?: string; transaction?: string } | undefined;
+      | { status?: string; transaction?: string; escrowExpiresAt?: string }
+      | undefined;
     return formatPendingInvokeResult({
       ...(typeof paidBody.runId === "string" ? { runId: paidBody.runId } : {}),
       provider,
@@ -1027,6 +1119,9 @@ export async function invokeWithPayment(
       paymentStatus: paymentObj?.status ?? "settlement_pending",
       ...(paymentObj?.transaction
         ? { transaction: paymentObj.transaction }
+        : {}),
+      ...(typeof paymentObj?.escrowExpiresAt === "string"
+        ? { escrowExpiresAt: paymentObj.escrowExpiresAt }
         : {}),
     });
   }

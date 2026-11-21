@@ -94,6 +94,7 @@ export interface GatewayPaidResponse {
     depositedAmountAtomic?: string;
     refundAmountAtomic?: string;
     depositTxHash?: string;
+    escrowExpiresAt?: string;
     payer?: string;
     providerPayTo?: string;
     payTo?: string;
@@ -223,6 +224,7 @@ export function formatPendingInvokeResult(options: {
   amountAtomic: string;
   paymentStatus: string;
   transaction?: string;
+  escrowExpiresAt?: string;
 }): Record<string, unknown> {
   return {
     status: "PENDING",
@@ -235,6 +237,9 @@ export function formatPendingInvokeResult(options: {
     idempotencyKey: options.idempotencyKey,
     amountAtomic: options.amountAtomic,
     amountFormatted: formatFusdAtomic(BigInt(options.amountAtomic)),
+    ...(options.escrowExpiresAt
+      ? { escrowExpiresAt: options.escrowExpiresAt }
+      : {}),
     payment: {
       status: options.paymentStatus,
       ...(options.transaction
@@ -243,7 +248,12 @@ export function formatPendingInvokeResult(options: {
             snowtraceUrl: snowtraceTxUrl(options.transaction),
           }
         : {}),
+      ...(options.escrowExpiresAt
+        ? { escrowExpiresAt: options.escrowExpiresAt }
+        : {}),
     },
-    note: "Settlement or receipt confirmation is pending. Retry invoke_facet with the same provider, facetName, version, idempotencyKey, and input to reconcile without a second charge.",
+    note: options.runId
+      ? `Settlement or receipt confirmation is pending. Retry invoke_facet with the same provider, facetName, version, idempotencyKey, and input to reconcile without a second charge. If an escrow hold remains pending past expiry, run \`facet escrow reclaim ${options.runId}\` to recover locked fUSD on Avalanche.`
+      : "Settlement or receipt confirmation is pending. Retry invoke_facet with the same provider, facetName, version, idempotencyKey, and input to reconcile without a second charge.",
   };
 }
