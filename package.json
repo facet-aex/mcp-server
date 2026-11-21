@@ -40,7 +40,7 @@
   },
   "packageManager": "npm@11.6.2",
   "dependencies": {
-    "@facet-aex/cli": "0.3.0",
+    "@facet-aex/cli": "0.4.0",
     "@modelcontextprotocol/sdk": "1.32.2",
     "@x402/core": "2.30.0",
     "@x402/evm": "2.30.0",
